@@ -914,7 +914,7 @@ test('a live crypto engine decrypts inbound megolm traffic, seals outbound sends
   }
 });
 
-test('the bot own room messages are neither recorded nor presented as other member speech', async () => {
+test('the bot own room messages are stored as bot answers, never as other member speech', async () => {
   const own = messageEvent({ sender: BOT, body: '我上一轮答过的内容' });
   const ambient = messageEvent({ sender: '@carol:example.org', body: '今天的构建报错了' });
   const mention = messageEvent({
@@ -939,9 +939,11 @@ test('the bot own room messages are neither recorded nor presented as other memb
       'the mention reaches the harness');
     const prompt = context.harness.prompts.at(-1);
     ok(prompt.includes('今天的构建报错了'), 'third-party chatter is still offered as background');
-    ok(!prompt.includes('我上一轮答过的内容'), 'the bot own echoed message is not presented as other member speech');
-    deepStrictEqual(history.search({ roomId: '!group:example.org', query: '我上一轮答过的内容' }), [],
-      'the bot own message stays out of the shared room record');
+    ok(prompt.includes('我上一轮答过的内容'), 'the bot own earlier answer is backfilled through the room-visible window');
+    ok(prompt.includes(BOT), 'the backfilled answer stays attributed to the bot itself instead of any member');
+    const ownRecord = history.search({ roomId: '!group:example.org', query: '我上一轮答过的内容' });
+    ok(ownRecord.length === 1 && ownRecord[0].kind === 'bot',
+      'the bot own message is stored under its own kind, never as human speech');
   } finally {
     await context.stop();
   }
@@ -957,6 +959,10 @@ test('a mentioned group reply is conditioned on unaddressed same-day room chatte
   const history = await new MatrixRoomHistoryStore(join(directory, 'matrix-history.json')).load();
   const context = await createContext({
     roomHistory: history,
+    // The legacy inline background block serves deployments that switched the
+    // whole structured chain off; with the room-visible window shipped on the
+    // structured collectors would answer this turn instead.
+    config: { visibleContextEnabled: false },
     apiOptions: {
       initial: {
         next_batch: 's1',

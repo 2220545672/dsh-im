@@ -271,6 +271,7 @@ export class MatrixRuntime {
       && typeof roomHistory.consumePending === 'function'
       && typeof roomHistory.pending === 'function'
       && typeof roomHistory.search === 'function'
+      && typeof roomHistory.recent === 'function'
       ? roomHistory
       : null;
     this.#roomContextLimit = safeInt(config.roomContextLimit, 1, 500, 50);
@@ -282,6 +283,13 @@ export class MatrixRuntime {
     this.#rootOnceEnabled = config.rootContextOnceEnabled === true;
     this.#replyContextEnabled = config.replyContextEnabled === true;
     this.#ambientContextEnabled = config.ambientContextEnabled === true;
+    // The room-visible window is shipped on: what members can read in the room
+    // timeline reaches the model as collected context, bounded only by the
+    // window and budget knobs below.
+    this.#visibleContextEnabled = config.visibleContextEnabled !== false;
+    this.#visibleContextWindowMs = safeInt(config.visibleContextWindowMs, 10_000, 86_400_000, 600_000);
+    this.#visibleContextLimit = safeInt(config.visibleContextLimit, 1, 50, 8);
+    this.#visibleContextChars = safeInt(config.visibleContextChars, 200, 200_000, 4_000);
     this.#contextMaxChars = safeInt(config.contextMaxChars, 200, 200_000, 8_000);
     this.#replyMaxDepth = safeInt(config.replyMaxDepth, 1, 10, 5);
     this.#rootRegistry = new RootContextRegistry({ state });
@@ -332,6 +340,10 @@ export class MatrixRuntime {
   #rootOnceEnabled = false;
   #replyContextEnabled = false;
   #ambientContextEnabled = false;
+  #visibleContextEnabled = true;
+  #visibleContextWindowMs = 600_000;
+  #visibleContextLimit = 8;
+  #visibleContextChars = 4_000;
   #contextMaxChars = 8_000;
   #replyMaxDepth = 5;
   #rootRegistry = null;
@@ -707,6 +719,7 @@ export class MatrixRuntime {
       if (outcome.drop === 'mention-required'
         || outcome.drop === 'reply-to-human'
         || outcome.drop === 'reply-target-unknown') this.#recordRoomAmbient(roomId, event);
+      else if (outcome.drop === 'self') this.#recordRoomBotReply(roomId, event);
       return;
     }
     const message = { ...outcome.message };
@@ -752,7 +765,8 @@ export class MatrixRuntime {
   #structuredContextActive() {
     return this.#rootOnceEnabled === true
       || this.#replyContextEnabled === true
-      || this.#ambientContextEnabled === true;
+      || this.#ambientContextEnabled === true
+      || this.#visibleContextEnabled === true;
   }
 
   /** Sync classifier fed to the trigger table: a bound event id proves bot authorship. */
@@ -862,6 +876,7 @@ export class MatrixRuntime {
         const entries = [];
         let used = 0;
         const offer = (entry) => {
+          if (entry.eventId && entries.some((existing) => existing.eventId === entry.eventId)) return false;
           const cost = (typeof entry.text === 'string' ? entry.text.length : 0) + 48;
           if (used + cost > this.#contextMaxChars) return false;
           used += cost;
@@ -911,12 +926,42 @@ export class MatrixRuntime {
             })) break;
           }
         }
+        // The room-visible window backfills the surrounding readback an
+        // elliptical follow-up leans on — earlier answered questions and the
+        // bot's own results included — whatever the other collectors did not
+        // already carry and this conversation has not seen yet. It leads the
+        // ambient queries so the chronological room window keeps the earlier
+        // slots; the offer guard then keeps later collectors from repeating it.
+        if (this.#visibleContextEnabled && message.kind === 'group' && this.#roomHistory) {
+          const seenEventIds = new Set(entries.map((entry) => entry.eventId).filter(Boolean));
+          if (typeof message.messageId === 'string' && message.messageId) seenEventIds.add(message.messageId);
+          const window = this.#roomHistory.recent({
+            roomId,
+            exclude: seenEventIds,
+            limit: this.#visibleContextLimit,
+            maxChars: this.#visibleContextChars,
+            sinceTs: Date.now() - this.#visibleContextWindowMs,
+          });
+          for (const record of window) {
+            if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
+            if (!offer({
+              collector: 'room-visible',
+              roomId,
+              eventId: record.eventId,
+              sender: record.sender,
+              name: record.name,
+              ts: record.ts,
+              text: record.text,
+            })) break;
+          }
+        }
         if (this.#ambientContextEnabled && message.kind === 'group' && this.#ambientProvider) {
           const { burst, recent } = this.#ambientProvider.query({
             roomId,
             senderId: typeof message.senderId === 'string' ? message.senderId : '',
           });
           for (const record of burst) {
+            if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
             if (!offer({
               collector: 'ambient-burst',
               roomId,
@@ -928,6 +973,7 @@ export class MatrixRuntime {
             })) break;
           }
           for (const record of recent) {
+            if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
             if (!offer({
               collector: 'ambient-recent',
               roomId,
@@ -938,6 +984,12 @@ export class MatrixRuntime {
               text: record.text,
             })) break;
           }
+        }
+        // The trigger body itself now rides this conversation's model input; the
+        // ledger records that so a later turn's room-visible window never
+        // re-serves the question the session already answered verbatim.
+        if (typeof message.messageId === 'string' && message.messageId) {
+          this.#markContextInjected(conversationKey, [message.messageId]);
         }
         return entries;
       },
@@ -951,7 +1003,7 @@ export class MatrixRuntime {
         if (root && typeof sessionId === 'string' && sessionId) {
           await this.#rootRegistry.markInjected({ routeKey: conversationKey, sessionId, rootId: root.eventId });
         }
-        const collected = entries.filter((entry) => entry.collector === 'reply' || entry.collector === 'thread-root');
+        const collected = entries.filter((entry) => entry.collector === 'reply' || entry.collector === 'thread-root' || entry.collector === 'room-visible');
         if (collected.length > 0) {
           this.#markContextInjected(conversationKey, collected.map((entry) => entry.eventId).filter(Boolean));
         }
@@ -983,6 +1035,30 @@ export class MatrixRuntime {
       ts: Number.isSafeInteger(event?.origin_server_ts) ? event.origin_server_ts : Date.now(),
       kind: 'human',
       injected: false,
+    });
+  }
+
+  // The bot's own room answers are as readable to members as any human turn,
+  // so the room-visible window store keeps them too. Streamed answers echo back
+  // as their final edit event; the pending placeholder and non-text events are
+  // content-free echoes skipped to keep the window free of pure noise.
+  #recordRoomBotReply(roomId, event) {
+    if (!this.#roomHistory || !this.#roomContextEnabled || !this.#visibleContextEnabled) return;
+    if (this.#dmRooms.has(roomId)) return;
+    const eventId = typeof event?.event_id === 'string' ? event.event_id : '';
+    const body = typeof event?.content?.body === 'string' ? event.content.body.trim() : '';
+    if (!eventId || !body || body === t('正在处理…')) return;
+    const msgtype = event?.content?.msgtype;
+    if (msgtype && msgtype !== 'm.text') return;
+    const self = this.#botUserId ?? '';
+    this.#roomHistory.append({
+      roomId,
+      eventId,
+      sender: self,
+      name: self ? this.#resolveSenderDisplayName(roomId, self) : null,
+      text: body,
+      ts: Number.isSafeInteger(event?.origin_server_ts) ? event.origin_server_ts : Date.now(),
+      kind: 'bot',
     });
   }
 

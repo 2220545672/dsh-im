@@ -312,7 +312,10 @@ test('a reply trigger rides along its resolved reply chain framed by attribution
 
 test('the same-sender burst ahead of the trigger arrives as attributed ambient context and is consumed once', async () => {
   const now = Date.now();
-  const context = await createContext({ config: { ambientContextEnabled: true }, withRoomHistory: true });
+  const context = await createContext({
+    config: { ambientContextEnabled: true, visibleContextEnabled: false },
+    withRoomHistory: true,
+  });
   try {
     await context.runtime.start();
     // The room record is the ambient source; seed it the way the runtime records unaddressed chatter.
@@ -552,6 +555,90 @@ test('a room-shared conversation labels each turn with its speaker once the prof
     await context.waitForPromptCount(3);
     ok(context.harness.prompts[2].startsWith('carol: 我这里又有一个问题'),
       'another member is labelled with its own identity in the shared conversation');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('the room-visible window backfills the answered chain an elliptical follow-up leans on', async () => {
+  const context = await createContext({
+    withRoomHistory: true,
+    config: { ambientContextEnabled: true },
+  });
+  const botEvent = (body) => ({
+    type: 'm.room.message',
+    event_id: nextEventId(),
+    sender: BOT,
+    origin_server_ts: Date.now(),
+    content: { msgtype: 'm.text', body },
+  });
+  try {
+    await context.runtime.start();
+    context.fake.pushEvents([groupMessage({
+      sender: '@rjd:example.org',
+      body: addressedBody('成都今天天气'),
+      content: mentionContent(),
+    })]);
+    await context.waitForPromptCount(1);
+
+    // The pending placeholder and the final streamed answer echo back on the
+    // timeline as bot-authored events; only the answer is content worth storing.
+    context.fake.pushEvents([botEvent('正在处理…'), botEvent('成都今天多云转晴，18~27°C')]);
+    await eventually(() => context.roomHistory
+      .recent({ roomId: ROOM, limit: 20 })
+      .some((entry) => entry.kind === 'bot'), 'the bot answer is stored as room-visible history');
+    deepStrictEqual(
+      context.roomHistory.recent({ roomId: ROOM, limit: 20 }).some((entry) => entry.text === '正在处理…'),
+      false,
+      'the content-free pending placeholder stays out of the room-visible store',
+    );
+
+    context.fake.pushEvents([groupMessage({ sender: '@rjd:example.org', body: '重庆呢' })]);
+    await eventually(() => context.roomHistory
+      .recent({ roomId: ROOM, limit: 20 })
+      .some((entry) => entry.text === '重庆呢'), 'the unmentioned follow-up is stored');
+
+    // The elliptical follow-ups are posted in a thread opened off the answered
+    // turn, so their forked conversation never saw the mainline question-answer
+    // pair in its own session history and the window must backfill it.
+    const threadRoot = nextEventId();
+    const inThread = (content) => ({
+      ...content,
+      'm.relates_to': { chain: [{ event_id: threadRoot, rel_type: 'm.thread' }] },
+    });
+    context.fake.pushEvents([groupMessage({
+      sender: '@rjd:example.org',
+      body: addressedBody('上海呢'),
+      content: inThread(mentionContent()),
+    })]);
+    await context.waitForPromptCount(2);
+    const bodies = contextBlockBodies(context.harness.prompts[1]);
+    deepStrictEqual(bodies.map((body) => body.content), [
+      '成都今天天气',
+      '成都今天多云转晴，18~27°C',
+      '重庆呢',
+    ], 'the collected context carries the earlier question, its answer, and the dropped follow-up in chronological order');
+    deepStrictEqual(bodies.map((body) => body.collector), [
+      'room-visible',
+      'room-visible',
+      'room-visible',
+    ], 'the room-visible window leads the collection and the offer guard keeps the ambient collectors from repeating it');
+    deepStrictEqual(bodies.map((body) => body.sender), [
+      '@rjd:example.org',
+      BOT,
+      '@rjd:example.org',
+    ]);
+    ok(context.harness.prompts[1].endsWith('rjd: 上海呢'), 'the direct question stays the last verbatim word');
+
+    context.fake.pushEvents([groupMessage({
+      sender: '@rjd:example.org',
+      body: addressedBody('广州呢'),
+      content: inThread(mentionContent()),
+    })]);
+    await context.waitForPromptCount(3);
+    deepStrictEqual(contextBlockBodies(context.harness.prompts[2]), [],
+      'the ledger and the ambient consumption keep an already-served chain from being served twice');
+    ok(context.harness.prompts[2].endsWith('rjd: 广州呢'));
   } finally {
     await context.stop();
   }

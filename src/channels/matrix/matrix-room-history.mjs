@@ -257,6 +257,32 @@ export class MatrixRoomHistoryStore {
   }
 
   /**
+   * Recent room-visible entries for a context window: every kind, whether or
+   * not already consumed, newest-bounded by a count, a character budget, and a
+   * freshness floor, with caller-named events skipped. Pure read — consumption
+   * bookkeeping stays with the caller's per-conversation ledger.
+   */
+  recent({ roomId, exclude = null, limit = 8, maxChars = 4_000, sinceTs = 0 } = {}) {
+    const room = this.#value.rooms[roomId];
+    if (!room) return [];
+    const cap = boundedInteger(limit, MIN_ROOM_CONTEXT_LIMIT, MAX_ROOM_CONTEXT_LIMIT, 8);
+    const charCap = boundedInteger(maxChars, MIN_ROOM_CONTEXT_CHARS, MAX_ROOM_CONTEXT_CHARS, 4_000);
+    const floor = Number.isSafeInteger(sinceTs) ? sinceTs : 0;
+    const skip = exclude instanceof Set ? exclude : new Set(Array.isArray(exclude) ? exclude : []);
+    const selected = [];
+    let used = 0;
+    for (let index = room.entries.length - 1; index >= 0 && selected.length < cap; index -= 1) {
+      const entry = room.entries[index];
+      if (entry.ts <= floor || skip.has(entry.eventId)) continue;
+      const cost = entry.text.length + (entry.name ? entry.name.length + 2 : 1);
+      if (selected.length > 0 && used + cost > charCap) break;
+      selected.unshift(entry);
+      used += cost;
+    }
+    return selected;
+  }
+
+  /**
    * Mark recorded entries as already offered to a conversation so no later
    * query re-offers them (the ambient provider's consumption step). Only ids of
    * live entries count; the count of newly marked ids is returned so callers
