@@ -159,6 +159,18 @@ test('recent windows stay inside the message list they name', async () => {
     ['主线句'], 'a window without an explicit thread reads the mainline');
 });
 
+test('a thread window holds its root bubble even when the root was sent on the mainline', async () => {
+  const store = await newStore();
+  // An answer sent as a reply that opened a thread is stored where it was sent
+  // — the mainline — yet the thread panel shows that bubble as its root message.
+  store.append(ev({ eventId: '$root1:example.org', sender: '@bot:example.org', text: '根回答', kind: 'bot', threadId: null, ts: NOW - 40_000 }));
+  store.append(ev({ eventId: '$other1:example.org', text: '别的话题的消息', threadId: '$other:example.org', ts: NOW - 30_000 }));
+  deepStrictEqual(store.recent({ roomId: '!room:example.org', threadId: '$root1:example.org', limit: 10 }).map((entry) => entry.text),
+    ['根回答'], 'the thread window includes the root bubble stored on the mainline');
+  deepStrictEqual(store.recent({ roomId: '!room:example.org', threadId: null, limit: 10 }).map((entry) => entry.text),
+    ['根回答'], 'the mainline window keeps the root on the list it was sent to');
+});
+
 test('revise brings a stored entry to its latest edit frame and records the last frame when nothing is stored', async () => {
   const store = await newStore();
   equal(store.revise({ roomId: '!room:example.org', eventId: '$s1:example.org', sender: '@bot:example.org', text: '首帧', ts: NOW - 5_000, threadId: '$t9:example.org' }), true,

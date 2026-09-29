@@ -73,7 +73,9 @@ function normalizeEntry(raw) {
   const eventId = cleanText(raw.eventId, 255);
   const text = cleanText(raw.text, ENTRY_TEXT_CHARS);
   if (!eventId) return null;
-  if (!text && raw.fromBot !== true) return null;
+  // Bot entries may arrive content-free: a pending-placeholder receipt keeps
+  // the authorship record until the first edit frame revises it to the body.
+  if (!text && raw.fromBot !== true && raw.kind !== 'bot') return null;
   const kind = raw.kind === 'bot' || raw.fromBot === true ? 'bot'
     : raw.kind === 'command' ? 'command' : 'human';
   return {
@@ -252,6 +254,17 @@ export class MatrixRoomHistoryStore {
   }
 
   /**
+   * The recorded kind of one event ('bot', 'human' or 'command'), or null when
+   * the event is not stored. Lets callers reason about authorship without
+   * trusting an id the room record has never seen.
+   */
+  kindOf({ roomId, eventId } = {}) {
+    const room = this.#value.rooms[roomId];
+    const entry = room?.entries.find((candidate) => candidate.eventId === eventId);
+    return entry ? entry.kind : null;
+  }
+
+  /**
    * Search the recorded room history across the retained window. Substring match
    * against text and speaker display name (case-insensitive), with optional
    * inclusive time bounds and a recency-first limit. Used to surface older room
@@ -286,8 +299,11 @@ export class MatrixRoomHistoryStore {
    * not already consumed, newest-bounded by a count, a character budget, and a
    * freshness floor, with caller-named events skipped. The window stays inside
    * one message list — the room's mainline (`threadId: null`) or one thread —
-   * so messages members cannot read in the current conversation stay out. Pure
-   * read — consumption bookkeeping stays with the caller's per-conversation ledger.
+   * so messages members cannot read in the current conversation stay out. A
+   * thread window also holds that thread's root bubble: the panel shows the
+   * root message itself, and an answer sent as a reply that opened a thread is
+   * stored on the mainline where it was sent. Pure read — consumption
+   * bookkeeping stays with the caller's per-conversation ledger.
    */
   recent({ roomId, threadId = null, exclude = null, limit = 8, maxChars = 4_000, sinceTs = 0 } = {}) {
     const room = this.#value.rooms[roomId];
@@ -301,7 +317,8 @@ export class MatrixRoomHistoryStore {
     let used = 0;
     for (let index = room.entries.length - 1; index >= 0 && selected.length < cap; index -= 1) {
       const entry = room.entries[index];
-      if ((entry.threadId ?? null) !== wantedThread) continue;
+      if ((entry.threadId ?? null) !== wantedThread && !(wantedThread !== null && entry.eventId === wantedThread)) continue;
+      if (!entry.text) continue;
       if (entry.ts <= floor || skip.has(entry.eventId)) continue;
       const cost = entry.text.length + (entry.name ? entry.name.length + 2 : 1);
       if (selected.length > 0 && used + cost > charCap) break;

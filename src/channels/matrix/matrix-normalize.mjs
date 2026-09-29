@@ -240,18 +240,13 @@ function cleanEventId(value) {
  * The target of a genuine reply relation. A falling-back relation is the
  * thread-membership declaration clients add automatically when sending inside a
  * thread; per the Matrix spec it is not a human reply, so it must not drive
- * reply context collection, reply classification or recorded reply targets.
+ * reply context collection, reply classification, recorded reply targets, or
+ * the thread fork decision.
  */
 function replyEventIdOf(content) {
   const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
   if (!inReplyTo || inReplyTo.is_falling_back === true) return null;
   return cleanEventId(inReplyTo.event_id);
-}
-
-/** The thread root a falling-back relation names, when the relation falls back. */
-function fallingBackTargetOf(content) {
-  const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
-  return inReplyTo?.is_falling_back === true ? cleanEventId(inReplyTo.event_id) : null;
 }
 
 /**
@@ -298,10 +293,6 @@ export function normalizeMatrixTimelineEvent({
 
   const threadId = threadIdOf(content);
   const replyToEventId = replyEventIdOf(content);
-  // A falling-back relation still names the thread root it belongs to, and that
-  // is the evidence the inherit fork policy uses to keep a reply-opened thread
-  // on the conversation its target belongs to while people continue inside it.
-  const fallingBackThreadTarget = fallingBackTargetOf(content);
   const rawText = typeof content.body === 'string' ? content.body : '';
   const mentioned = detectMatrixMention(content, botUserId);
   const commandLike = isMatrixCommandLike(rawText);
@@ -335,18 +326,25 @@ export function normalizeMatrixTimelineEvent({
   if (MEDIA_MSGTYPES.has(msgtype) && !media) return { drop: 'media-unusable' };
   if (msgtype !== 'm.text' && msgtype !== 'm.notice' && !MEDIA_MSGTYPES.has(msgtype)) return { drop: 'type' };
 
-  // Thread conversation fork policy. A reply whose thread root equals its reply
-  // target only says "answer this message" — the client started a thread at the
-  // replied-to event — so it inherits the conversation its target belongs to
-  // (the room's main conversation) instead of forking a fresh session. A post
-  // made inside an existing thread still forks that thread's conversation.
-  // `isolate` restores fork-always; `auto` prefers the bot-event binding table
-  // when the channel supplies one for the reply target.
+  // Thread conversation fork policy. A genuine reply whose thread root equals
+  // its reply target says "answer this message" — the client started a thread at
+  // the replied-to event — so it inherits the conversation its target belongs to
+  // (the room's main conversation) instead of forking a fresh session. The
+  // thread-membership declaration clients attach automatically (a falling-back
+  // relation) is not a human reply and never selects a conversation: posts made
+  // inside a thread fork that thread's own conversation. A reply to a root the
+  // bot itself authored does the same — the panel under a bot answer is read as
+  // its own message list, not as a continuation of the mainline turn the answer
+  // once replied to. `isolate` restores fork-always; `auto` prefers the
+  // bot-event binding table when the channel supplies one for the reply target.
   const threadsMode = config.threadsMode === 'isolate' || config.threadsMode === 'auto'
     ? config.threadsMode
     : 'inherit';
+  const rootIsBotAuthored = kind === 'group' && threadId !== null
+    && ((typeof deps.classifyReplyTarget === 'function' && deps.classifyReplyTarget(threadId) === 'bot')
+      || (typeof deps.isBotRoomEvent === 'function' && deps.isBotRoomEvent(roomId, threadId) === true));
   const inheritsThreadTarget = kind === 'group' && threadId !== null
-    && threadsMode !== 'isolate' && (replyToEventId === threadId || fallingBackThreadTarget === threadId);
+    && threadsMode !== 'isolate' && replyToEventId === threadId && !rootIsBotAuthored;
   const routeThreadId = kind === 'group' && threadId !== null && !inheritsThreadTarget ? threadId : null;
   const boundRouteKey = threadsMode === 'auto' && kind === 'group' && replyToEventId !== null
     && typeof deps.routeOverrideForReply === 'function'

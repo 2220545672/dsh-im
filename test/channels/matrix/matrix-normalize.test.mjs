@@ -252,8 +252,8 @@ test('a falling-back thread relation is membership and never a reply', () => {
       'm.in_reply_to': { event_id: '$threadA:example.org', is_falling_back: true },
     },
   }), { config: { requireMention: false } });
-  deepStrictEqual(inherited.message.conversationId, 'room:!roomA:example.org',
-    'continuing inside a reply-opened thread keeps inheriting the main conversation');
+  deepStrictEqual(inherited.message.conversationId, 'room:!roomA:example.org$$threadA:example.org',
+    'the automatically attached thread-membership declaration never selects a conversation: posts inside a thread fork the thread conversation');
   const realReply = funnel(event({}, {
     body: 'hi <@bot:example.org> 回复某条消息',
     'm.mentions': { user_ids: ['@bot:example.org'] },
@@ -264,4 +264,31 @@ test('a falling-back thread relation is membership and never a reply', () => {
   }));
   deepStrictEqual(realReply.message.replyToEventId, '$target:example.org',
     'a real reply relation without the fallback flag keeps its target');
+});
+
+test('the fork policy inherits only replies to a human thread-opening root', () => {
+  // A genuine reply whose root is its own target opened the thread at a human
+  // mainline message: the answer belongs to the mainline conversation.
+  const opening = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复主聊消息开话题',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': {
+      chain: [{ event_id: '$threadR:example.org', rel_type: 'm.thread' }],
+      'm.in_reply_to': { event_id: '$threadR:example.org' },
+    },
+  }));
+  deepStrictEqual(opening.message.conversationId, 'room:!roomA:example.org',
+    'a genuine reply to the thread-opening root inherits the main conversation');
+  // A genuine reply to a root the bot authored — the panel under a bot answer —
+  // is its own message list and forks the thread conversation instead.
+  const toBotAnswer = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复 bot 的回答气泡',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': {
+      chain: [{ event_id: '$botAnswer:example.org', rel_type: 'm.thread' }],
+      'm.in_reply_to': { event_id: '$botAnswer:example.org' },
+    },
+  }), { deps: { isBotRoomEvent: (roomId, eventId) => eventId === '$botAnswer:example.org' } });
+  deepStrictEqual(toBotAnswer.message.conversationId, 'room:!roomA:example.org$$botAnswer:example.org',
+    'a reply to a bot-authored root forks the thread conversation rather than joining the mainline turn');
 });

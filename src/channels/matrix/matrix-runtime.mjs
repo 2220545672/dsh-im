@@ -710,6 +710,7 @@ export class MatrixRuntime {
         createMediaSource: (mediaContent, msgtype) => this.#createMediaSource(mediaContent, msgtype),
         classifyReplyTarget: (eventId) => this.#classifyReplyTarget(eventId),
         routeOverrideForReply: (eventId) => this.#routeOverrideForReply(eventId),
+        isBotRoomEvent: (roomId, eventId) => (this.#roomHistory?.kindOf({ roomId, eventId }) ?? null) === 'bot',
       },
     });
     if (outcome.drop) {
@@ -876,8 +877,13 @@ export class MatrixRuntime {
       collect: async ({ message, conversationKey, sessionIdHint }) => {
         const entries = [];
         let used = 0;
+        const placeholder = t('正在处理…');
         const offer = (entry) => {
           if (entry.eventId && entries.some((existing) => existing.eventId === entry.eventId)) return false;
+          // An event whose fetched body is still the pending-placeholder
+          // template carries no content members can read: homeservers hand
+          // back the pre-edit body, so the receipt never enters the context.
+          if (typeof entry.text === 'string' && entry.text.trim() === placeholder) return false;
           const cost = (typeof entry.text === 'string' ? entry.text.length : 0) + 48;
           if (used + cost > this.#contextMaxChars) return false;
           used += cost;
@@ -893,7 +899,6 @@ export class MatrixRuntime {
             rootId: message.threadId,
           });
           if (plan.inject && !this.#contextAlreadyInjected(conversationKey, message.threadId)) {
-            const placeholder = t('正在处理…');
             const rootId = message.threadId;
             const root = await this.#fetchContextEvent(roomId, rootId);
             // A pending placeholder that opened the thread reads as its receipt
@@ -921,7 +926,15 @@ export class MatrixRuntime {
             startReplyTo: message.replyToEventId,
             maxDepth: this.#replyMaxDepth,
           });
-          for (const node of chain) {
+          // A machine receipt is not a human target: the chain answers only up
+          // to the pending-placeholder body (oldest ancestor first, so entries
+          // nearer the trigger follow it). The walk ends at the receipt and the
+          // question behind a placeholder never crosses into the panel above it.
+          const receiptAt = chain.findIndex(
+            (node) => typeof node.text === 'string' && node.text.trim() === placeholder,
+          );
+          const walkable = receiptAt >= 0 ? chain.slice(receiptAt + 1) : chain;
+          for (const node of walkable) {
             if (this.#contextAlreadyInjected(conversationKey, node.eventId)) continue;
             if (!offer({
               collector: 'reply',
@@ -1056,10 +1069,17 @@ export class MatrixRuntime {
     if (!this.#roomHistory || !this.#roomContextEnabled || !this.#visibleContextEnabled) return;
     if (this.#dmRooms.has(roomId)) return;
     const body = typeof text === 'string' ? text.trim() : '';
-    if (!eventId || !body || body === t('正在处理…')) return;
+    if (!eventId) return;
     const self = this.#botUserId ?? '';
     const name = self ? this.#resolveSenderDisplayName(roomId, self) : null;
     const ts = Date.now();
+    // A pending placeholder earns a content-free bot receipt: the window never
+    // renders an empty entry, while the fork policy and the final edit frames
+    // (which revise the same entry to the read body) both key off this id.
+    if (!body || body === t('正在处理…')) {
+      this.#roomHistory.append({ roomId, eventId, sender: self, name, text: '', ts, threadId, kind: 'bot' });
+      return;
+    }
     if (edit) {
       this.#roomHistory.revise({ roomId, eventId, sender: self, name, text: body, ts, threadId });
       return;

@@ -589,7 +589,7 @@ test('a thread conversation keeps its own message list in view and never borrows
     withRoomHistory: true,
     answer,
     events: { [questionId]: questionEvent, [placeholderId]: placeholderEvent },
-    config: { ambientContextEnabled: true, rootContextOnceEnabled: true },
+    config: { ambientContextEnabled: true, rootContextOnceEnabled: true, replyContextEnabled: true },
   });
   try {
     await context.runtime.start();
@@ -621,11 +621,17 @@ test('a thread conversation keeps its own message list in view and never borrows
       .recent({ roomId: ROOM, threadId: placeholderId, limit: 20 })
       .some((entry) => entry.text === '重庆呢'), 'the in-thread follow-up is stored under its thread');
 
+    // The in-thread question also carries a genuine reply to the thread's
+    // placeholder root event: the homeserver hands back that event's pre-edit
+    // receipt body, and the collection gate must keep it out of the context.
     context.fake.pushEvents([roomEvent({
       eventId: nextEventId(),
       sender: '@rjd:example.org',
       body: addressedBody('上海呢'),
-      content: { ...mentionContent(), 'm.relates_to': threadChain },
+      content: {
+        ...mentionContent(),
+        'm.relates_to': { ...threadChain, 'm.in_reply_to': { event_id: placeholderId } },
+      },
     })]);
     await context.waitForPromptCount(2);
     const bodies = contextBlockBodies(context.harness.prompts[1]);
