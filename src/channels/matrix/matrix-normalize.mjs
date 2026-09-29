@@ -221,7 +221,8 @@ function eventOriginTs(event) {
   return Number.isSafeInteger(ts) && ts > 0 ? (ts < 1e12 ? ts * 1_000 : ts) : null;
 }
 
-function threadIdOf(content) {
+/** The thread root a timeline event belongs to, from its MSC3402 relations. */
+export function threadIdOf(content) {
   const relates = content?.['m.relates_to'];
   if (!relates || typeof relates !== 'object') return null;
   const chain = Array.isArray(relates.chain) ? relates.chain : [];

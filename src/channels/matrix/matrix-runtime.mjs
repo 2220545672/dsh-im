@@ -22,6 +22,7 @@ import {
   normalizeMatrixDeliveryTarget,
   normalizeMatrixTimelineEvent,
   resolveBangMatrixCommand,
+  threadIdOf,
 } from './matrix-normalize.mjs';
 import {
   DEFAULT_ROOM_HISTORY_LIMIT,
@@ -892,12 +893,28 @@ export class MatrixRuntime {
             rootId: message.threadId,
           });
           if (plan.inject && !this.#contextAlreadyInjected(conversationKey, message.threadId)) {
-            const root = await this.#fetchContextEvent(roomId, message.threadId);
-            if (root) {
+            const placeholder = t('正在处理…');
+            let rootId = message.threadId;
+            let root = await this.#fetchContextEvent(roomId, rootId);
+            // A pending placeholder that opened the thread is not the question
+            // the thread answers. When the root reads as that template, the
+            // question the placeholder replied to is what members actually see
+            // above the thread, so the root climbs that one genuine relation.
+            if (root && root.text === placeholder) {
+              const named = typeof root.replyTo === 'string' && root.replyTo ? root.replyTo : null;
+              const ancestor = named ? await this.#fetchContextEvent(roomId, named) : null;
+              if (ancestor && ancestor.text && ancestor.text !== placeholder) {
+                rootId = named;
+                root = ancestor;
+              } else {
+                root = null;
+              }
+            }
+            if (root && !this.#contextAlreadyInjected(conversationKey, rootId)) {
               offer({
                 collector: 'thread-root',
                 roomId,
-                eventId: message.threadId,
+                eventId: rootId,
                 sender: root.sender,
                 name: root.name,
                 ts: root.ts,
@@ -937,6 +954,7 @@ export class MatrixRuntime {
           if (typeof message.messageId === 'string' && message.messageId) seenEventIds.add(message.messageId);
           const window = this.#roomHistory.recent({
             roomId,
+            threadId: typeof message.threadId === 'string' && message.threadId ? message.threadId : null,
             exclude: seenEventIds,
             limit: this.#visibleContextLimit,
             maxChars: this.#visibleContextChars,
@@ -959,6 +977,7 @@ export class MatrixRuntime {
           const { burst, recent } = this.#ambientProvider.query({
             roomId,
             senderId: typeof message.senderId === 'string' ? message.senderId : '',
+            threadId: typeof message.threadId === 'string' && message.threadId ? message.threadId : null,
           });
           for (const record of burst) {
             if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
@@ -1033,32 +1052,47 @@ export class MatrixRuntime {
       sender,
       text: body,
       ts: Number.isSafeInteger(event?.origin_server_ts) ? event.origin_server_ts : Date.now(),
+      threadId: threadIdOf(event?.content),
       kind: 'human',
       injected: false,
     });
   }
 
-  // The bot's own room answers are as readable to members as any human turn,
-  // so the room-visible window store keeps them too. Streamed answers echo back
-  // as their final edit event; the pending placeholder and non-text events are
-  // content-free echoes skipped to keep the window free of pure noise.
-  #recordRoomBotReply(roomId, event) {
+  // One recorded bot message, from any exit that reaches the room: a plain
+  // send, an edit frame of a streamed answer, or an echoed timeline event.
+  // The pending placeholder carries no content and stays out of the record.
+  #recordBotRoomMessage({ roomId, eventId, text, threadId = null, edit = false }) {
     if (!this.#roomHistory || !this.#roomContextEnabled || !this.#visibleContextEnabled) return;
     if (this.#dmRooms.has(roomId)) return;
-    const eventId = typeof event?.event_id === 'string' ? event.event_id : '';
-    const body = typeof event?.content?.body === 'string' ? event.content.body.trim() : '';
+    const body = typeof text === 'string' ? text.trim() : '';
     if (!eventId || !body || body === t('正在处理…')) return;
-    const msgtype = event?.content?.msgtype;
-    if (msgtype && msgtype !== 'm.text') return;
     const self = this.#botUserId ?? '';
-    this.#roomHistory.append({
+    const name = self ? this.#resolveSenderDisplayName(roomId, self) : null;
+    const ts = Date.now();
+    if (edit) {
+      this.#roomHistory.revise({ roomId, eventId, sender: self, name, text: body, ts, threadId });
+      return;
+    }
+    this.#roomHistory.append({ roomId, eventId, sender: self, name, text: body, ts, threadId, kind: 'bot' });
+  }
+
+  // The timeline face of bot authorship: kept for homeservers that echo bot
+  // events back, coalescing by event id with the send-face records. Edit
+  // frames are owned by the send-face revising writer and skip here so one
+  // streamed answer never lands twice under relation ids.
+  #recordRoomBotReply(roomId, event) {
+    if (!this.#roomHistory || !this.#roomContextEnabled || !this.#visibleContextEnabled) return;
+    const content = event?.content;
+    if (content?.['m.new_content'] || content?.['m.rel_type'] === 'm.replace') return;
+    const eventId = typeof event?.event_id === 'string' ? event.event_id : '';
+    const body = typeof content?.body === 'string' ? content.body : '';
+    const msgtype = content?.msgtype;
+    if (msgtype && msgtype !== 'm.text') return;
+    this.#recordBotRoomMessage({
       roomId,
       eventId,
-      sender: self,
-      name: self ? this.#resolveSenderDisplayName(roomId, self) : null,
       text: body,
-      ts: Number.isSafeInteger(event?.origin_server_ts) ? event.origin_server_ts : Date.now(),
-      kind: 'bot',
+      threadId: threadIdOf(content),
     });
   }
 
@@ -1074,6 +1108,7 @@ export class MatrixRuntime {
       sender: message.senderId,
       text,
       ts: Date.now(),
+      threadId: typeof message.threadId === 'string' && message.threadId ? message.threadId : null,
       kind,
       injected,
     });
@@ -1338,6 +1373,13 @@ export class MatrixRuntime {
         ...(options.signal ? { signal: options.signal } : {}),
       });
       if (typeof result?.event_id === 'string') providerMessageIds.push(result.event_id);
+      // The send exits are the trusted record of what the room received: this
+      // deployment's homeserver verifiably does not echo bot-authored events
+      // back onto the timeline, so the room-visible store is fed here too and
+      // coalesces with any echo a different server does deliver.
+      if (options.recordRoom !== false) {
+        this.#recordBotRoomMessage({ roomId, eventId: result?.event_id, text: chunk, threadId });
+      }
     }
     return { providerMessageIds };
   }
@@ -1370,6 +1412,9 @@ export class MatrixRuntime {
           };
         }
         await this.#sendRoomEvent(roomId, 'm.room.message', content);
+        // Every edit frame revises the same entry, so the store ends holding the
+        // final body members read in the room regardless of frame count.
+        this.#recordBotRoomMessage({ roomId, eventId: streamMessageId, text, threadId, edit: true });
       },
       sendRemainder: async (chunk) => await this.#sendRoomText(target, chunk),
       messageIdForResult: (result) => result?.providerMessageIds?.at(-1) ?? null,

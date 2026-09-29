@@ -178,12 +178,12 @@ function loggerStub() {
   };
 }
 
-async function createContext({ config = {}, initialEvents = [], events = {}, withRoomHistory = false } = {}) {
+async function createContext({ config = {}, initialEvents = [], events = {}, withRoomHistory = false, answer } = {}) {
   const directory = await makeTempDirectory('dsh-im-matrix-context-');
   const sidecar = await new MatrixSidecarStore(join(directory, 'matrix.json')).load();
   const state = stateStub();
   const logger = loggerStub();
-  const harness = harnessStub();
+  const harness = harnessStub(answer);
   const initial = initialEvents.length > 0
     ? { next_batch: 'b0', rooms: { join: { [ROOM]: { timeline: { events: initialEvents } } } } }
     : { next_batch: 'b0' };
@@ -560,84 +560,97 @@ test('a room-shared conversation labels each turn with its speaker once the prof
   }
 });
 
-test('the room-visible window backfills the answered chain an elliptical follow-up leans on', async () => {
+test('a thread conversation keeps its own message list in view and never borrows from the mainline', async () => {
+  const answer = '成都今天多云转晴，18~27°C，降水概率低';
+  const questionId = '$q1:example.org';
+  const placeholderId = '$ph:example.org';
+  const chongqingId = '$cq1:example.org';
+  const roomEvent = ({ eventId, sender, body, content = {} }) => ({
+    type: 'm.room.message',
+    event_id: eventId,
+    sender,
+    origin_server_ts: Date.now(),
+    content: { msgtype: 'm.text', body, ...content },
+  });
+  const threadChain = { chain: [{ event_id: placeholderId, rel_type: 'm.thread' }] };
+  const questionEvent = roomEvent({
+    eventId: questionId,
+    sender: '@rjd:example.org',
+    body: addressedBody('成都今天天气'),
+    content: mentionContent(),
+  });
+  const placeholderEvent = roomEvent({
+    eventId: placeholderId,
+    sender: BOT,
+    body: '正在处理…',
+    content: { 'm.relates_to': { 'm.in_reply_to': { event_id: questionId } } },
+  });
   const context = await createContext({
     withRoomHistory: true,
-    config: { ambientContextEnabled: true },
-  });
-  const botEvent = (body) => ({
-    type: 'm.room.message',
-    event_id: nextEventId(),
-    sender: BOT,
-    origin_server_ts: Date.now(),
-    content: { msgtype: 'm.text', body },
+    answer,
+    events: { [questionId]: questionEvent, [placeholderId]: placeholderEvent },
+    config: { ambientContextEnabled: true, rootContextOnceEnabled: true },
   });
   try {
     await context.runtime.start();
-    context.fake.pushEvents([groupMessage({
-      sender: '@rjd:example.org',
-      body: addressedBody('成都今天天气'),
-      content: mentionContent(),
-    })]);
+    // The mainline question is answered from the send face; the homeserver in this
+    // deployment pattern echoes no bot-authored events back onto the timeline.
+    context.fake.pushEvents([questionEvent]);
     await context.waitForPromptCount(1);
-
-    // The pending placeholder and the final streamed answer echo back on the
-    // timeline as bot-authored events; only the answer is content worth storing.
-    context.fake.pushEvents([botEvent('正在处理…'), botEvent('成都今天多云转晴，18~27°C')]);
     await eventually(() => context.roomHistory
-      .recent({ roomId: ROOM, limit: 20 })
-      .some((entry) => entry.kind === 'bot'), 'the bot answer is stored as room-visible history');
-    deepStrictEqual(
-      context.roomHistory.recent({ roomId: ROOM, limit: 20 }).some((entry) => entry.text === '正在处理…'),
-      false,
-      'the content-free pending placeholder stays out of the room-visible store',
-    );
+      .recent({ roomId: ROOM, threadId: null, limit: 20 })
+      .some((entry) => entry.kind === 'bot' && entry.text === answer), 'the send-face answer is stored on the mainline');
 
-    context.fake.pushEvents([groupMessage({ sender: '@rjd:example.org', body: '重庆呢' })]);
+    // The answer began as a pending placeholder sent in reply to the question,
+    // which is the event that opened the thread; it carries no content and is
+    // never stored.
+    context.fake.pushEvents([placeholderEvent]);
+    deepStrictEqual(context.roomHistory
+      .recent({ roomId: ROOM, limit: 50 })
+      .some((entry) => entry.text === '正在处理…'), false, 'the placeholder stays out of the room record');
+
+    // Inside the thread, an unmentioned elliptical question is recorded with its
+    // thread membership for the same-list windows.
+    context.fake.pushEvents([roomEvent({
+      eventId: chongqingId,
+      sender: '@rjd:example.org',
+      body: '重庆呢',
+      content: { 'm.relates_to': threadChain },
+    })]);
     await eventually(() => context.roomHistory
-      .recent({ roomId: ROOM, limit: 20 })
-      .some((entry) => entry.text === '重庆呢'), 'the unmentioned follow-up is stored');
+      .recent({ roomId: ROOM, threadId: placeholderId, limit: 20 })
+      .some((entry) => entry.text === '重庆呢'), 'the in-thread follow-up is stored under its thread');
 
-    // The elliptical follow-ups are posted in a thread opened off the answered
-    // turn, so their forked conversation never saw the mainline question-answer
-    // pair in its own session history and the window must backfill it.
-    const threadRoot = nextEventId();
-    const inThread = (content) => ({
-      ...content,
-      'm.relates_to': { chain: [{ event_id: threadRoot, rel_type: 'm.thread' }] },
-    });
-    context.fake.pushEvents([groupMessage({
+    context.fake.pushEvents([roomEvent({
+      eventId: nextEventId(),
       sender: '@rjd:example.org',
       body: addressedBody('上海呢'),
-      content: inThread(mentionContent()),
+      content: { ...mentionContent(), 'm.relates_to': threadChain },
     })]);
     await context.waitForPromptCount(2);
     const bodies = contextBlockBodies(context.harness.prompts[1]);
-    deepStrictEqual(bodies.map((body) => body.content), [
-      '成都今天天气',
-      '成都今天多云转晴，18~27°C',
-      '重庆呢',
-    ], 'the collected context carries the earlier question, its answer, and the dropped follow-up in chronological order');
-    deepStrictEqual(bodies.map((body) => body.collector), [
-      'room-visible',
-      'room-visible',
-      'room-visible',
-    ], 'the room-visible window leads the collection and the offer guard keeps the ambient collectors from repeating it');
-    deepStrictEqual(bodies.map((body) => body.sender), [
-      '@rjd:example.org',
-      BOT,
-      '@rjd:example.org',
-    ]);
+    deepStrictEqual(bodies.map((body) => [body.collector, body.event, body.sender, body.content]), [
+      ['thread-root', questionId, '@rjd:example.org', addressedBody('成都今天天气')],
+      ['room-visible', chongqingId, '@rjd:example.org', '重庆呢'],
+    ], 'the placeholder root climbs the genuine relation to the question it answered, and the window carries only what the thread itself shows besides the direct question — no mainline borrowings');
+    ok(!bodies.some((body) => body.content === answer),
+      'the mainline answer visible on the other message list is not injected into the thread');
     ok(context.harness.prompts[1].endsWith('rjd: 上海呢'), 'the direct question stays the last verbatim word');
 
-    context.fake.pushEvents([groupMessage({
+    // The next in-thread turn finally reads the thread's own visible bot answer —
+    // the question the members above the composer can see — while everything
+    // already served stays out.
+    context.fake.pushEvents([roomEvent({
+      eventId: nextEventId(),
       sender: '@rjd:example.org',
       body: addressedBody('广州呢'),
-      content: inThread(mentionContent()),
+      content: { ...mentionContent(), 'm.relates_to': threadChain },
     })]);
     await context.waitForPromptCount(3);
-    deepStrictEqual(contextBlockBodies(context.harness.prompts[2]), [],
-      'the ledger and the ambient consumption keep an already-served chain from being served twice');
+    const later = contextBlockBodies(context.harness.prompts[2]);
+    deepStrictEqual(later.map((body) => [body.collector, body.sender, body.content]), [
+      ['room-visible', BOT, answer],
+    ], 'the in-thread answer members can read is collected for the next turn, and the ledger keeps every earlier entry from a second serving');
     ok(context.harness.prompts[2].endsWith('rjd: 广州呢'));
   } finally {
     await context.stop();

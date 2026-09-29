@@ -145,3 +145,26 @@ test('formatRoomContextBlock fences and stamps third-party background lines', as
   const bare = formatRoomContextBlock(selected, {});
   equal(bare.split('\n')[0], '[09:12] [alice] 第一句', 'without labels the run still reads as stamped transcript lines');
 });
+
+test('recent windows stay inside the message list they name', async () => {
+  const store = await newStore();
+  store.append(ev({ text: '主线句', threadId: null, ts: NOW - 30_000 }));
+  store.append(ev({ sender: '@bot:example.org', text: '话题答', kind: 'bot', threadId: '$t1:example.org', ts: NOW - 20_000 }));
+  store.append(ev({ text: '话题问', threadId: '$t1:example.org', ts: NOW - 10_000 }));
+  deepStrictEqual(store.recent({ roomId: '!room:example.org', threadId: null, limit: 10 }).map((entry) => entry.text),
+    ['主线句'], 'the mainline window excludes thread entries');
+  deepStrictEqual(store.recent({ roomId: '!room:example.org', threadId: '$t1:example.org', limit: 10 }).map((entry) => entry.text),
+    ['话题答', '话题问'], 'the thread window keeps the list of the thread itself in chronological order, bot answer included');
+  deepStrictEqual(store.recent({ roomId: '!room:example.org', limit: 10 }).map((entry) => entry.text),
+    ['主线句'], 'a window without an explicit thread reads the mainline');
+});
+
+test('revise brings a stored entry to its latest edit frame and records the last frame when nothing is stored', async () => {
+  const store = await newStore();
+  equal(store.revise({ roomId: '!room:example.org', eventId: '$s1:example.org', sender: '@bot:example.org', text: '首帧', ts: NOW - 5_000, threadId: '$t9:example.org' }), true,
+    'revising an entry that is not stored yet records it');
+  store.revise({ roomId: '!room:example.org', eventId: '$s1:example.org', sender: '@bot:example.org', text: '终帧正文', ts: NOW });
+  const entries = store.recent({ roomId: '!room:example.org', threadId: '$t9:example.org', limit: 10 });
+  deepStrictEqual(entries.map((entry) => [entry.text, entry.kind, entry.ts]), [['终帧正文', 'bot', NOW]],
+    'the last frame owns the entry and earlier frames do not linger as siblings');
+});

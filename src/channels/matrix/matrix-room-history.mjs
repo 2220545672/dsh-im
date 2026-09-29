@@ -82,6 +82,7 @@ function normalizeEntry(raw) {
     name: cleanText(raw.name, 256) || localPart(raw.sender),
     text,
     ts: toTimestamp(raw.ts),
+    threadId: cleanText(raw.threadId, 255) || null,
     kind,
     injected: raw.injected === true || kind !== 'human',
   };
@@ -168,9 +169,9 @@ export class MatrixRoomHistoryStore {
    * consumed so they never surface as pending context. Duplicate event ids are
    * ignored to keep a replayed sync from double-counting an entry.
    */
-  append({ roomId, eventId, sender, name, text, ts, kind = 'human', injected } = {}) {
+  append({ roomId, eventId, sender, name, text, ts, threadId, kind = 'human', injected } = {}) {
     if (!roomId || typeof eventId !== 'string' || !eventId.trim()) return null;
-    const entry = normalizeEntry({ eventId, sender, name, text, ts, kind, injected });
+    const entry = normalizeEntry({ eventId, sender, name, text, ts, threadId, kind, injected });
     if (!entry) return null;
     const room = this.#roomEntry(roomId);
     if (room.entries.some((existing) => existing.eventId === entry.eventId)) return null;
@@ -182,6 +183,30 @@ export class MatrixRoomHistoryStore {
     }
     this.#persist();
     return entry;
+  }
+
+  /**
+   * Bring one recorded entry to its latest edit frame — the shape a streamed bot
+   * answer takes while the client edits the placeholder event toward the final
+   * body. Revising an entry that is not stored yet records it, so the last frame
+   * always owns the entry regardless of which frame reaches here first.
+   */
+  revise({ roomId, eventId, sender, name, text, ts, threadId, kind = 'bot' } = {}) {
+    if (!roomId || typeof eventId !== 'string' || !eventId.trim()) return false;
+    const room = this.#roomEntry(roomId);
+    const existing = room.entries.find((entry) => entry.eventId === eventId);
+    if (existing) {
+      const nextText = cleanText(text, ENTRY_TEXT_CHARS);
+      if (nextText) existing.text = nextText;
+      const nextTs = Number.isSafeInteger(ts) && ts > 0 ? ts : null;
+      if (nextTs !== null && nextTs >= existing.ts) existing.ts = nextTs;
+      const nextName = cleanText(name, 256);
+      if (nextName) existing.name = nextName;
+      if (existing.threadId === null) existing.threadId = cleanText(threadId, 255) || null;
+      this.#persist();
+      return true;
+    }
+    return this.append({ roomId, eventId, sender, name, text, ts, threadId, kind }) !== null;
   }
 
   /**
@@ -259,20 +284,24 @@ export class MatrixRoomHistoryStore {
   /**
    * Recent room-visible entries for a context window: every kind, whether or
    * not already consumed, newest-bounded by a count, a character budget, and a
-   * freshness floor, with caller-named events skipped. Pure read — consumption
-   * bookkeeping stays with the caller's per-conversation ledger.
+   * freshness floor, with caller-named events skipped. The window stays inside
+   * one message list — the room's mainline (`threadId: null`) or one thread —
+   * so messages members cannot read in the current conversation stay out. Pure
+   * read — consumption bookkeeping stays with the caller's per-conversation ledger.
    */
-  recent({ roomId, exclude = null, limit = 8, maxChars = 4_000, sinceTs = 0 } = {}) {
+  recent({ roomId, threadId = null, exclude = null, limit = 8, maxChars = 4_000, sinceTs = 0 } = {}) {
     const room = this.#value.rooms[roomId];
     if (!room) return [];
     const cap = boundedInteger(limit, MIN_ROOM_CONTEXT_LIMIT, MAX_ROOM_CONTEXT_LIMIT, 8);
     const charCap = boundedInteger(maxChars, MIN_ROOM_CONTEXT_CHARS, MAX_ROOM_CONTEXT_CHARS, 4_000);
     const floor = Number.isSafeInteger(sinceTs) ? sinceTs : 0;
+    const wantedThread = cleanText(threadId, 255) || null;
     const skip = exclude instanceof Set ? exclude : new Set(Array.isArray(exclude) ? exclude : []);
     const selected = [];
     let used = 0;
     for (let index = room.entries.length - 1; index >= 0 && selected.length < cap; index -= 1) {
       const entry = room.entries[index];
+      if ((entry.threadId ?? null) !== wantedThread) continue;
       if (entry.ts <= floor || skip.has(entry.eventId)) continue;
       const cost = entry.text.length + (entry.name ? entry.name.length + 2 : 1);
       if (selected.length > 0 && used + cost > charCap) break;

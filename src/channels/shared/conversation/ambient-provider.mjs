@@ -45,14 +45,18 @@ export class WindowAmbientProvider {
 
   /**
    * Collect the ambient entries that may accompany one triggered message.
-   * @param {{roomId: string, senderId: string, now?: number}} query
+   * @param {{roomId: string, senderId: string, threadId?: string|null, now?: number}} query
+   *   — the optional `threadId` keeps the window inside one message list: the
+   *   room's mainline (`null`) or the named thread, matching what members read
+   *   in the current conversation.
    * @returns {{burst: object[], recent: object[]}} both chronological; already-consumed and
    *   non-human entries are excluded, and the recent list never repeats a burst entry.
    */
-  query({ roomId, senderId, now = Date.now() } = {}) {
+  query({ roomId, senderId, threadId = null, now = Date.now() } = {}) {
     if (!this.#store || !roomId || typeof senderId !== 'string' || !senderId) {
       return { burst: [], recent: [] };
     }
+    const wantedThread = typeof threadId === 'string' && threadId ? threadId : null;
     const span = Math.max(this.#windowMs, this.#burstGapMs);
     // The record answers newest-first; one extra slice covers the burst run on
     // top of the recent budget before anything is filtered out.
@@ -73,6 +77,7 @@ export class WindowAmbientProvider {
       : null;
     const candidates = chronological.filter((entry) => entry.kind === 'human'
       && entry.injected !== true
+      && (entry.threadId ?? null) === wantedThread
       && (pendingIds === null || pendingIds.has(entry.eventId)));
     const burst = [];
     for (let index = candidates.length - 1; index >= 0; index -= 1) {
