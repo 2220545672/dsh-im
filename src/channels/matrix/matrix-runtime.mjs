@@ -894,23 +894,14 @@ export class MatrixRuntime {
           });
           if (plan.inject && !this.#contextAlreadyInjected(conversationKey, message.threadId)) {
             const placeholder = t('正在处理…');
-            let rootId = message.threadId;
-            let root = await this.#fetchContextEvent(roomId, rootId);
-            // A pending placeholder that opened the thread is not the question
-            // the thread answers. When the root reads as that template, the
-            // question the placeholder replied to is what members actually see
-            // above the thread, so the root climbs that one genuine relation.
-            if (root && root.text === placeholder) {
-              const named = typeof root.replyTo === 'string' && root.replyTo ? root.replyTo : null;
-              const ancestor = named ? await this.#fetchContextEvent(roomId, named) : null;
-              if (ancestor && ancestor.text && ancestor.text !== placeholder) {
-                rootId = named;
-                root = ancestor;
-              } else {
-                root = null;
-              }
-            }
-            if (root && !this.#contextAlreadyInjected(conversationKey, rootId)) {
+            const rootId = message.threadId;
+            const root = await this.#fetchContextEvent(roomId, rootId);
+            // A pending placeholder that opened the thread reads as its receipt
+            // line in the thread header, not as question content; what members can
+            // read of that answer is the final body, which reaches the model
+            // through the same-list room-visible record instead, so a
+            // placeholder root contributes no entry of its own.
+            if (root && root.text !== placeholder && !this.#contextAlreadyInjected(conversationKey, rootId)) {
               offer({
                 collector: 'thread-root',
                 roomId,

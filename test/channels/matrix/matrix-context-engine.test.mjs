@@ -630,9 +630,8 @@ test('a thread conversation keeps its own message list in view and never borrows
     await context.waitForPromptCount(2);
     const bodies = contextBlockBodies(context.harness.prompts[1]);
     deepStrictEqual(bodies.map((body) => [body.collector, body.event, body.sender, body.content]), [
-      ['thread-root', questionId, '@rjd:example.org', addressedBody('成都今天天气')],
       ['room-visible', chongqingId, '@rjd:example.org', '重庆呢'],
-    ], 'the placeholder root climbs the genuine relation to the question it answered, and the window carries only what the thread itself shows besides the direct question — no mainline borrowings');
+    ], 'the placeholder root contributes no entry of its own: the collection opens with what the thread itself shows, and the mainline question behind the placeholder is not borrowed in');
     ok(!bodies.some((body) => body.content === answer),
       'the mainline answer visible on the other message list is not injected into the thread');
     ok(context.harness.prompts[1].endsWith('rjd: 上海呢'), 'the direct question stays the last verbatim word');
