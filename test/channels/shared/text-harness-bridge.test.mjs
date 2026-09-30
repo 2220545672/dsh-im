@@ -3416,3 +3416,232 @@ test('a permanently failing delivery stops retrying after a bounded number of at
   assert.equal(fixture.seen.has('poison-mail'), true,
     'after the budget is spent the id becomes a tombstone instead of retrying forever');
 });
+
+test('consecutive plain-text posts from one sender fold into a single dispatch', async () => {
+  const fixture = stateFixture({ 'group:room-coalesce': 'session-coalesce' });
+  const prompts = [];
+  const sent = [];
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(text); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-coalesce',
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        return '合并后的回答';
+      },
+    },
+    logger: { warn() {}, error() {} },
+    coalesceWindowMs: 30,
+  });
+  const room = (id, content) => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-coalesce',
+    speakerName: 'rjd',
+  });
+  await Promise.all([
+    bridge.accept(room('fold-one', '先问的那句')),
+    bridge.accept(room('fold-two', '补充的那句')),
+    bridge.waitForIdle(),
+  ]);
+  assert.equal(prompts.length, 1, 'two bubbles from one sender dispatch as one turn');
+  assert.match(prompts[0], /先问的那句/);
+  assert.match(prompts[0], /补充的那句/);
+  assert.equal(fixture.seen.has('fold-one'), true);
+  assert.equal(fixture.seen.has('fold-two'), true);
+  assert.equal(sent.length, 1, 'one folded turn delivers one answer');
+});
+
+test('a mid-turn follow-up from the same sender steers the in-flight turn instead of queueing', async () => {
+  const fixture = stateFixture({ 'group:room-steer': 'session-steer' });
+  const prompts = [];
+  const sent = [];
+  const steers = [];
+  const gate = deferred();
+  let askEntered = () => {};
+  const entered = new Promise((resolve) => { askEntered = resolve; });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(text); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-steer',
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        askEntered();
+        await gate.promise;
+        return '首轮答案';
+      },
+      steerActiveTurn: async (_sessionId, text) => {
+        steers.push(text);
+        return true;
+      },
+    },
+    logger: { warn() {}, error() {} },
+    autoSteerSameSender: true,
+    autoSteerLimit: 5,
+  });
+  const room = (id, content, senderId = 'actor-a') => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-steer',
+    senderId,
+    speakerName: senderId === 'actor-a' ? 'rjd' : 'kim',
+  });
+  const first = bridge.accept(room('steer-first', '原问题'));
+  await within(entered, 1_000, 'the first turn never reached the harness');
+  const followUp = bridge.accept(room('steer-follow', '补充一句约束'));
+  await eventually(() => steers.length === 1);
+  gate.resolve();
+  await Promise.all([first, followUp, bridge.waitForIdle()]);
+  assert.match(steers[0], /补充一句约束/);
+  assert.match(steers[0], /rjd/, 'a steered follow-up carries its speaker label');
+  assert.equal(prompts.length, 1, 'the steered follow-up opens no second turn');
+  assert.equal(fixture.seen.has('steer-follow'), true);
+  assert.deepEqual(sent, ['首轮答案'], 'the steered follow-up does not consume an extra answer');
+});
+
+test('a different sender queues behind the in-flight turn while the same sender steers', async () => {
+  const fixture = stateFixture({ 'group:room-mixed': 'session-mixed' });
+  const prompts = [];
+  const steers = [];
+  const gate = deferred();
+  let askEntered = () => {};
+  const entered = new Promise((resolve) => { askEntered = resolve; });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async () => undefined },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-mixed',
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        askEntered();
+        await gate.promise;
+        return '答';
+      },
+      steerActiveTurn: async (_sessionId, text) => {
+        steers.push(text);
+        return true;
+      },
+    },
+    logger: { warn() {}, error() {} },
+    autoSteerSameSender: true,
+    autoSteerLimit: 5,
+  });
+  const room = (id, content, senderId = 'actor-a') => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-mixed',
+    senderId,
+    speakerName: senderId === 'actor-a' ? 'rjd' : 'kim',
+  });
+  const first = bridge.accept(room('mix-first', '原问题'));
+  await within(entered, 1_000, 'the first turn never reached the harness');
+  const same = bridge.accept(room('mix-same', '同人补充'));
+  const other = bridge.accept(room('mix-other', '他人提问', 'actor-b'));
+  await eventually(() => steers.length === 1);
+  assert.equal(prompts.length, 1, 'the other sender waits behind the in-flight turn');
+  assert.equal(steers.length, 1, 'only the opening sender steers');
+  gate.resolve();
+  await Promise.all([first, same, other, bridge.waitForIdle()]);
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /他人提问/, 'the queued message keeps its turn once the in-flight one settles');
+  assert.equal(fixture.seen.has('mix-other'), true);
+});
+
+test('auto-steer falls back to the queue once the per-turn steer budget is spent', async () => {
+  const fixture = stateFixture({ 'group:room-budget': 'session-budget' });
+  const prompts = [];
+  const steers = [];
+  const gate = deferred();
+  let askEntered = () => {};
+  const entered = new Promise((resolve) => { askEntered = resolve; });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async () => undefined },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-budget',
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        askEntered();
+        await gate.promise;
+        return '答';
+      },
+      steerActiveTurn: async (_sessionId, text) => {
+        steers.push(text);
+        return true;
+      },
+    },
+    logger: { warn() {}, error() {} },
+    autoSteerSameSender: true,
+    autoSteerLimit: 1,
+  });
+  const room = (id, content) => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-budget',
+    speakerName: 'rjd',
+  });
+  const first = bridge.accept(room('budget-first', '原问题'));
+  await within(entered, 1_000, 'the first turn never reached the harness');
+  const steered = bridge.accept(room('budget-one', '第一次补充'));
+  await eventually(() => steers.length === 1);
+  const capped = bridge.accept(room('budget-two', '超限的补充'));
+  gate.resolve();
+  await Promise.all([first, steered, capped, bridge.waitForIdle()]);
+  assert.equal(steers.length, 1, 'the budget admits one steer into the in-flight turn');
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /超限的补充/, 'the over-budget follow-up queues as an ordinary turn');
+});
+
+test('media payloads neither fold into the window nor ride the auto-steer lane', async () => {
+  const fixture = stateFixture({ 'group:room-media': 'session-media' });
+  const prompts = [];
+  const steers = [];
+  const gate = deferred();
+  let askEntered = () => {};
+  const entered = new Promise((resolve) => { askEntered = resolve; });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async () => undefined },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-media',
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        askEntered();
+        await gate.promise;
+        return '答';
+      },
+      steerActiveTurn: async (_sessionId, text) => {
+        steers.push(text);
+        return true;
+      },
+    },
+    logger: { warn() {}, error() {} },
+    autoSteerSameSender: true,
+    autoSteerLimit: 5,
+    coalesceWindowMs: 30,
+  });
+  const room = (id, content, overrides = {}) => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-media',
+    speakerName: 'rjd',
+    ...overrides,
+  });
+  const first = bridge.accept(room('media-first', '原问题'));
+  await within(entered, 1_000, 'the first turn never reached the harness');
+  const picture = bridge.accept(room('media-picture', '图上是什么', {
+    images: [{ data: Buffer.from('image') }],
+  }));
+  await new Promise((resolve) => { setTimeout(resolve, 60); });
+  assert.equal(steers.length, 0, 'a media follow-up is not text the model can steer with mid-turn');
+  gate.resolve();
+  await Promise.all([first, picture, bridge.waitForIdle()]);
+  assert.equal(prompts.length, 2, 'the media message keeps its own turn');
+});

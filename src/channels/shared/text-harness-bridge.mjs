@@ -86,6 +86,8 @@ const FILE_ONLY_COMPLETION_TEXT = '任务已完成。';
  * attempts the mark stays and the message is treated as handled.
  */
 const MAX_DELIVERY_ATTEMPTS = 3;
+/** How many plain-text messages one coalescing window folds into one dispatch. */
+const MAX_COALESCE_MEMBERS = 8;
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -196,6 +198,13 @@ export class TextHarnessBridge {
   // the next poll can retry, and this counter is what keeps that from becoming
   // an infinite loop on a mail that always fails.
   #deliveryAttempts = new Map();
+  // Who opened the in-flight turn per conversation key, for the same-sender
+  // auto-steer lane; and the open coalescing windows awaiting their flush.
+  #turnAuthors = new Map();
+  #coalescing = new Map();
+  #autoSteerSameSender = false;
+  #autoSteerLimit = 0;
+  #coalesceWindowMs = 0;
 
   constructor({
     descriptor,
@@ -212,6 +221,9 @@ export class TextHarnessBridge {
     keepaliveIntervalMs = 4_000,
     interactionCard = null,
     contextHooks = null,
+    autoSteerSameSender = false,
+    autoSteerLimit = 0,
+    coalesceWindowMs = 0,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -229,6 +241,18 @@ export class TextHarnessBridge {
     this.#signal = signal;
     this.#keepaliveIntervalMs = keepaliveIntervalMs;
     this.#interactionCard = interactionCard ?? null;
+    // Opt-in follow-up lanes for channels whose groups run on rapid consecutive
+    // posts: fold a same sender's burst into one dispatch, and steer that
+    // sender's own mid-turn follow-ups into the in-flight turn instead of
+    // queueing them behind the answer they are meant to correct. Off unless a
+    // channel asks for them, so every other channel keeps the plain queue.
+    this.#autoSteerSameSender = autoSteerSameSender === true;
+    this.#autoSteerLimit = Number.isSafeInteger(autoSteerLimit) && autoSteerLimit > 0
+      ? Math.min(autoSteerLimit, 20)
+      : 0;
+    this.#coalesceWindowMs = Number.isSafeInteger(coalesceWindowMs) && coalesceWindowMs > 0
+      ? Math.min(coalesceWindowMs, 3_000)
+      : 0;
     // Channel-supplied conversation context pipeline (collect/render/consume/deliver).
     // Channels own what context means and how it is framed; the bridge only runs
     // the steps at the right points of one turn, so every hook is optional and a
@@ -482,33 +506,161 @@ export class TextHarnessBridge {
       pending.queue = current;
       return current;
     }
-    return this.#busyMessages.dispatch({
-      key, messageId, text: normalized.content,
-      commandText: text, mode: busyMessageMode,
-      onFailure: (error) => this.#signal?.aborted || error?.code === 'turn-stopped'
-        ? normalized.statusReaction?.clear() : normalized.statusReaction?.error(),
-      eligible: () => normalized.plainText !== false
-        && !hasInboundImages(normalized) && !hasInboundFiles(normalized)
-        && !hasReplyReference(normalized)
-        && canAutomaticallySteer(this.#accessPolicy, normalized.kind,
-          [senderId, normalized.senderAlternateId].filter(Boolean)),
-      harness: this.#harness, state: this.#state, status: this.#status,
-      signal: this.#signal, control: { owner: this, key }, logger: this.#logger,
-      acceptedMessageIds: this.#acceptedMessageIds,
-      pendingInteraction: () => this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
-      enhancement: {
-        snapshot: this.#acceptedMessageIds.get(messageId),
-        source: () => {
-          const source = normalized.contextSource?.();
-          return { channel: this.#descriptor.key, senderId, senderName: source?.senderName,
-            conversationTitle: source?.conversationTitle,
-            chatId: source?.chatId ?? normalized.conversationId, threadId: source?.threadId };
+    return this.#dispatchTrigger(normalized, messageId, senderId, key, {
+      // Ordinary destinations of the lanes fall through to the busy-mode dispatcher,
+      // keeping its steering, receipts, and routing serialization for what the lanes decline.
+      exit: (exitOptions) => this.#busyMessages.dispatch({
+        key, messageId, text: normalized.content,
+        commandText: text, mode: busyMessageMode,
+        onFailure: (error) => this.#signal?.aborted || error?.code === 'turn-stopped'
+          ? normalized.statusReaction?.clear() : normalized.statusReaction?.error(),
+        eligible: () => normalized.plainText !== false
+          && !hasInboundImages(normalized) && !hasInboundFiles(normalized)
+          && !hasReplyReference(normalized)
+          && canAutomaticallySteer(this.#accessPolicy, normalized.kind,
+            [senderId, normalized.senderAlternateId].filter(Boolean)),
+        harness: this.#harness, state: this.#state, status: this.#status,
+        signal: this.#signal, control: { owner: this, key }, logger: this.#logger,
+        acceptedMessageIds: this.#acceptedMessageIds,
+        pendingInteraction: () => this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
+        enhancement: {
+          snapshot: this.#acceptedMessageIds.get(messageId),
+          source: () => {
+            const source = normalized.contextSource?.();
+            return { channel: this.#descriptor.key, senderId, senderName: source?.senderName,
+              conversationTitle: source?.conversationTitle,
+              chatId: source?.chatId ?? normalized.conversationId, threadId: source?.threadId };
+          },
         },
-      },
-      isQueued: () => this.#queues.has(key),
-      enqueue: (options) => this.#enqueueMessage(normalized, messageId, senderId, key, options),
-      send: (reply) => this.#bot.sendText(normalized.replyTarget, reply),
+        isQueued: () => this.#queues.has(key),
+        enqueue: (enqueueOptions) => this.#enqueueMessage(normalized, messageId, senderId, key, enqueueOptions),
+        send: (reply) => this.#bot.sendText(normalized.replyTarget, reply),
+      }),
     });
+  }
+
+  /**
+   * The ordinary trigger exit, where a message becomes a turn. Three lanes:
+   * while the conversation runs, a plain-text follow-up from the very sender
+   * who opened the in-flight turn steers that turn (the room hears the
+   * correction at the next model step instead of after the whole answer);
+   * on an idle conversation, consecutive plain-text posts from one sender fold
+   * into a single dispatch inside a short window, so a burst split across
+   * bubbles becomes one turn; everything else — other senders, media, composed
+   * payloads — keeps the per-conversation queue that preserves one voice at a
+   * time.
+   * An `exit` hook, when provided, receives every ordinary queue destination of
+   * the lanes, so a channel can fall through to richer routing (busy-mode steering
+   * and queue receipts) for what these lanes decline.
+   */
+  #dispatchTrigger(message, messageId, senderId, key, { exit } = {}) {
+    const toQueue = (options) => (exit
+      ? exit(options)
+      : this.#enqueueMessage(message, messageId, senderId, key, options));
+    const plainText = !hasInboundImages(message) && !hasInboundFiles(message)
+      && message.plainText !== false
+      && Boolean(controlTextOf(message));
+    const author = this.#turnAuthors.get(key);
+    if (author !== undefined && plainText
+      && this.#autoSteerSameSender && this.#autoSteerLimit > 0
+      && author.senderId === senderId && author.steered < this.#autoSteerLimit) {
+      const text = this.#steerTextFor(message, messageId, senderId);
+      const sessionId = this.#state.sessionFor?.(key) ?? null;
+      if (text && sessionId !== null && typeof this.#harness.steerActiveTurn === 'function') {
+        return this.#harness
+          .steerActiveTurn(sessionId, text, { owner: this, key }, this.#signal ? { signal: this.#signal } : undefined)
+          .then((steered) => (steered
+            ? this.#settleSteeredTurn(author, messageId)
+            : toQueue()))
+          .catch(() => toQueue());
+      }
+    }
+    if (!this.#queues.has(key) && !this.#pendingInteractions.has(key) && !this.#approvals.hasPending(key)) {
+      const open = this.#coalescing.get(key);
+      if (open !== undefined) {
+        if (open.senderId === senderId && plainText && open.members.length < MAX_COALESCE_MEMBERS) {
+          open.members.push({ message, messageId });
+          return Promise.resolve();
+        }
+        // A different sender, or a payload the window may not fold: this
+        // message dispatches on its own while the window keeps collecting.
+        return toQueue();
+      }
+      if (this.#coalesceWindowMs > 0 && plainText) {
+        const opened = { senderId, members: [{ message, messageId }] };
+        const timer = setTimeout(() => { void this.#flushCoalesced(key); }, this.#coalesceWindowMs);
+        timer.unref?.();
+        this.#coalescing.set(key, opened);
+        return Promise.resolve();
+      }
+    }
+    return toQueue();
+  }
+
+  /** The model-facing body of an auto-steered follow-up, labelled like a turn. */
+  #steerTextFor(message, messageId, senderId) {
+    const body = cleanText(message.content) || controlTextOf(message);
+    if (!body) return null;
+    const labelled = message.kind === 'group' ? prependSpeakerLabel(body, message.speakerName) : body;
+    const snapshot = this.#acceptedMessageIds.get(messageId);
+    if (!snapshot) return labelled;
+    // A mid-turn follow-up carries the same provenance as the message that
+    // opened the turn, so the member who steers is identified to the model too.
+    const contextSource = message.contextSource?.();
+    return enhanceContextContent(labelled, snapshot, () => ({
+      channel: this.#descriptor.key,
+      senderId,
+      senderName: contextSource?.senderName,
+      conversationTitle: contextSource?.conversationTitle,
+      chatId: contextSource?.chatId ?? message.conversationId,
+      threadId: contextSource?.threadId,
+    }));
+  }
+
+  /** A steered message became part of the in-flight turn: settle its receipt. */
+  async #settleSteeredTurn(author, messageId) {
+    author.steered += 1;
+    if (!this.#state.hasSeen(messageId)) await this.#state.markSeen(messageId);
+    this.#status.messagesReceived += 1;
+    this.#status.lastMessageAt = new Date().toISOString();
+    this.#acceptedMessageIds.delete(messageId);
+    return true;
+  }
+
+  /**
+   * Dispatch a folded window as one turn: the merged body carries every
+   * member's text, the answer targets the newest message, and the extra
+   * members travel as `coalescedEventIds` so the channel ledger can retire
+   * them from its ambient window before it re-serves what this turn already
+   * says.
+   */
+  async #flushCoalesced(key) {
+    const open = this.#coalescing.get(key);
+    if (open === undefined) return;
+    this.#coalescing.delete(key);
+    if (this.#signal?.aborted) {
+      for (const member of open.members) this.#acceptedMessageIds.delete(member.messageId);
+      return;
+    }
+    const bodies = [];
+    for (const member of open.members) {
+      const body = cleanText(member.message.content) || controlTextOf(member.message);
+      if (body && !bodies.includes(body)) bodies.push(body);
+      this.#acceptedMessageIds.delete(member.messageId);
+      if (!this.#state.hasSeen(member.messageId)) await this.#state.markSeen(member.messageId);
+      this.#status.messagesReceived += 1;
+    }
+    if (bodies.length === 0) return;
+    this.#status.lastMessageAt = new Date().toISOString();
+    const last = open.members[open.members.length - 1];
+    const merged = {
+      ...last.message,
+      content: bodies.join('\n\n'),
+      ...(open.members.length > 1
+        ? { coalescedEventIds: open.members.slice(1).map((member) => member.messageId) }
+        : {}),
+    };
+    return this.#enqueueMessage(merged, last.messageId, open.senderId, key, { alreadyRecorded: true });
   }
 
   #finishLocalMessage(message, messageId, reply, { recordReceived = true } = {}) {
@@ -580,6 +732,13 @@ export class TextHarnessBridge {
       )),
       ...this.#approvalTasks,
       ...this.#commandTasks,
+      // An unexpired coalescing window drains through its own timer: wait out
+      // its worst-case life so a shutdown never drops folded messages before
+      // the flush enqueues them for the queue wait below to cover.
+      ...this.#coalescing.values().map(() => new Promise((resolve) => {
+        const timer = setTimeout(resolve, this.#coalesceWindowMs + 25);
+        timer.unref?.();
+      })),
     ]);
     await this.#deferred.whenIdle();
   }
@@ -906,6 +1065,10 @@ export class TextHarnessBridge {
         }, this.#keepaliveIntervalMs);
         keepaliveTimer.unref?.();
       }
+      // From here the conversation has a turn in flight that this sender
+      // opened: the auto-steer lane keys its authorship decision off this
+      // record, and the finally below retires it when the turn settles.
+      this.#turnAuthors.set(conversationKey, { senderId, steered: 0, turnMessageId: messageId });
       const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
         deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
@@ -1157,6 +1320,8 @@ export class TextHarnessBridge {
       return error.deliveryReceipt;
     } finally {
       stopKeepalive();
+      const inFlight = this.#turnAuthors.get(conversationKey);
+      if (inFlight?.turnMessageId === messageId) this.#turnAuthors.delete(conversationKey);
       await Promise.allSettled([
         this.#cancelPendingInteraction(conversationKey),
         this.#approvals.closeRoute(conversationKey),

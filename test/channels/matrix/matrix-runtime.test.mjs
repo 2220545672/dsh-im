@@ -604,6 +604,9 @@ test('bang commands resolve only through the known command catalog', async () =>
   const bang = messageEvent({ body: '!new', content: {} });
   const unknown = messageEvent({ body: '!deploy', content: {} });
   const context = await createContext({
+    // The fold window adds its full span before the forwarded `!deploy` dispatches;
+    // this test pins the command catalog, not the follow-up timing.
+    config: { coalesceWindowMs: 0 },
     isKnownCommand: (name) => ['new', 'compact', 'help', 'stop'].includes(name.replace(/^\/+/, '')),
     apiOptions: {
       initial: {

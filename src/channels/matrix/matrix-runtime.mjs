@@ -290,6 +290,13 @@ export class MatrixRuntime {
     this.#visibleContextEnabled = config.visibleContextEnabled !== false;
     this.#visibleContextWindowMs = safeInt(config.visibleContextWindowMs, 10_000, 86_400_000, 600_000);
     this.#visibleContextLimit = safeInt(config.visibleContextLimit, 1, 50, 8);
+    // Follow-up lanes for rooms run on rapid consecutive posts: a same sender's
+    // burst folds into one dispatch, and that sender's mid-turn follow-ups steer
+    // the in-flight turn rather than queueing behind the answer they correct.
+    // Other members' messages still queue one voice at a time.
+    this.#autoSteerSameSender = config.autoSteerSameSender !== false;
+    this.#autoSteerLimit = safeInt(config.autoSteerLimit, 0, 20, 5);
+    this.#coalesceWindowMs = safeInt(config.coalesceWindowMs, 0, 3_000, 450);
     this.#visibleContextChars = safeInt(config.visibleContextChars, 200, 200_000, 4_000);
     this.#contextMaxChars = safeInt(config.contextMaxChars, 200, 200_000, 8_000);
     this.#replyMaxDepth = safeInt(config.replyMaxDepth, 1, 10, 5);
@@ -344,6 +351,9 @@ export class MatrixRuntime {
   #visibleContextEnabled = true;
   #visibleContextWindowMs = 600_000;
   #visibleContextLimit = 8;
+  #autoSteerSameSender = true;
+  #autoSteerLimit = 5;
+  #coalesceWindowMs = 450;
   #visibleContextChars = 4_000;
   #contextMaxChars = 8_000;
   #replyMaxDepth = 5;
@@ -414,6 +424,9 @@ export class MatrixRuntime {
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
+      autoSteerSameSender: this.#autoSteerSameSender,
+      autoSteerLimit: this.#autoSteerLimit,
+      coalesceWindowMs: this.#coalesceWindowMs,
       // The binding table and the /new anchor reset serve the trigger policy and the
       // `auto` thread router, not only the context collectors, so those modes wire the
       // hooks even when every structured-context collector stays off.
@@ -878,6 +891,15 @@ export class MatrixRuntime {
         const entries = [];
         let used = 0;
         const placeholder = t('正在处理…');
+        // The coalescer folded this turn out of several bubbles: the extra
+        // members are already spoken here as the turn's own words, so the
+        // windows retire them with the turn instead of re-serving that text a
+        // turn later.
+        if (Array.isArray(message.coalescedEventIds)) {
+          this.#markContextInjected(conversationKey, message.coalescedEventIds.filter(
+            (eventId) => typeof eventId === 'string' && eventId,
+          ));
+        }
         const offer = (entry) => {
           if (entry.eventId && entries.some((existing) => existing.eventId === entry.eventId)) return false;
           // An event whose fetched body is still the pending-placeholder
