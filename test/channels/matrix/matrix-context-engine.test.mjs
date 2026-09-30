@@ -642,9 +642,8 @@ test('a thread conversation keeps its own message list in view and never borrows
       'the mainline answer visible on the other message list is not injected into the thread');
     ok(context.harness.prompts[1].endsWith('rjd: 上海呢'), 'the direct question stays the last verbatim word');
 
-    // The next in-thread turn finally reads the thread's own visible bot answer —
-    // the question the members above the composer can see — while everything
-    // already served stays out.
+    // The thread's own previous answer is this session's word: it lives in the
+    // transcript already, so the window serves it to no later turn either.
     context.fake.pushEvents([roomEvent({
       eventId: nextEventId(),
       sender: '@rjd:example.org',
@@ -652,11 +651,100 @@ test('a thread conversation keeps its own message list in view and never borrows
       content: { ...mentionContent(), 'm.relates_to': threadChain },
     })]);
     await context.waitForPromptCount(3);
-    const later = contextBlockBodies(context.harness.prompts[2]);
-    deepStrictEqual(later.map((body) => [body.collector, body.sender, body.content]), [
-      ['room-visible', BOT, answer],
-    ], 'the in-thread answer members can read is collected for the next turn, and the ledger keeps every earlier entry from a second serving');
+    deepStrictEqual(contextBlockBodies(context.harness.prompts[2]), [],
+      'the answer this same session produced is transcript content already, so the window keeps it out of the next prompt');
     ok(context.harness.prompts[2].endsWith('rjd: 广州呢'));
+  } finally {
+    await context.stop();
+  }
+});
+
+test('a conversation never re-reads the answers it produced, while third-party room speech still rides along', async () => {
+  const answer = '这段回答由本场会话自己产出';
+  const context = await createContext({
+    withRoomHistory: true,
+    answer,
+    initialEvents: [groupMessage({ sender: '@alice:example.org', body: addressedBody('第一个问题'), content: mentionContent() })],
+  });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    await eventually(() => sentRoomMessages(context.fake).length > 0, 'the bot answer left the send face');
+    context.fake.pushEvents([
+      groupMessage({ sender: '@dave:example.org', body: '回答之后的旁聊' }),
+      groupMessage({ sender: '@alice:example.org', body: addressedBody('第二个问题'), content: mentionContent() }),
+    ]);
+    await context.waitForPromptCount(2);
+    const bodies = contextBlockBodies(context.harness.prompts[1]);
+    ok(!bodies.some((body) => body.content === answer),
+      'the answer the same conversation produced is transcript content already, so the window keeps it out');
+    ok(bodies.some((body) => body.collector === 'room-visible' && body.content === '回答之后的旁聊'),
+      'third-party speech the session cannot know stays served through the window');
+    const stored = context.roomHistory.search({ roomId: ROOM, query: answer });
+    ok(stored.length > 0 && stored.every((entry) => entry.kind === 'bot' && entry.turnKey === MAIN_KEY && entry.turnEpoch === 0),
+      'the send-face record carries the provenance that retired it: its own conversation key and the current session generation');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('another conversation keeps reading a bot answer that its own conversation stopped re-serving', async () => {
+  const answer = '主线里给出的那一条回答全文';
+  const context = await createContext({
+    withRoomHistory: true,
+    answer,
+    initialEvents: [groupMessage({ sender: '@alice:example.org', body: addressedBody('主线提问'), content: mentionContent() })],
+  });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    await eventually(() => sentRoomMessages(context.fake).length > 0, 'the bot answer left the send face');
+    const answerEventId = sentRoomMessages(context.fake)[0].sentEventId;
+    context.fake.pushEvents([groupMessage({
+      sender: '@bob:example.org',
+      body: addressedBody('在这条回答下开线追问'),
+      content: {
+        ...mentionContent(),
+        'm.relates_to': {
+          chain: [{ event_id: answerEventId, rel_type: 'm.thread' }],
+          'm.in_reply_to': { event_id: answerEventId, is_falling_back: true },
+        },
+      },
+    })]);
+    await context.waitForPromptCount(2);
+    ok(context.harness.prompts[1].includes(answer),
+      'a member opening the panel under the bot answer still reads that bubble: the retirement is scoped to the producing conversation');
+    ok(!context.harness.prompts[1].includes('主线提问'),
+      'the mainline question behind the panel stays out of the thread window, provenance-stamped or not');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('a fresh session reads back the answers of the session it replaced, once', async () => {
+  const answer = '旧会话留下的那条回答';
+  const context = await createContext({
+    withRoomHistory: true,
+    answer,
+    initialEvents: [groupMessage({ sender: '@alice:example.org', body: addressedBody('旧会话提问'), content: mentionContent() })],
+  });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    await eventually(() => sentRoomMessages(context.fake).length > 0, 'the bot answer left the send face');
+    context.fake.pushEvents([groupMessage({ sender: '@alice:example.org', body: addressedBody('继续追问'), content: mentionContent() })]);
+    await context.waitForPromptCount(2);
+    ok(!contextBlockBodies(context.harness.prompts[1]).some((body) => body.content === answer),
+      'the running session does not re-read its own answer');
+    context.fake.pushEvents([groupMessage({ sender: '@alice:example.org', body: '/new' })]);
+    await eventually(() => sentRoomMessages(context.fake).some((call) =>
+      typeof call.content?.body === 'string' && call.content.body.includes('已开启新会话')), 'the /new confirmation');
+    context.fake.pushEvents([groupMessage({ sender: '@alice:example.org', body: addressedBody('新会话首问'), content: mentionContent() })]);
+    await context.waitForPromptCount(3);
+    ok(contextBlockBodies(context.harness.prompts[2]).some((body) => body.content === answer),
+      'the successor session never saw that answer, so the generation bump lets it read back once');
+    ok(context.roomHistory.search({ roomId: ROOM, query: answer }).some((entry) => entry.turnEpoch === 0),
+      'the stored provenance still names the generation that produced the bubble');
   } finally {
     await context.stop();
   }

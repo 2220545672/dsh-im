@@ -87,6 +87,12 @@ function normalizeEntry(raw) {
     threadId: cleanText(raw.threadId, 255) || null,
     kind,
     injected: raw.injected === true || kind !== 'human',
+    // Provenance of a bubble one Session produced: the conversation key it was
+    // delivered under plus the session generation that stamped it. The runtime's
+    // room window retires such a bubble for that conversation while the stamped
+    // generation is current; other conversations and a fresh session still read it.
+    turnKey: cleanText(raw.turnKey, 512) || null,
+    turnEpoch: Number.isSafeInteger(raw.turnEpoch) && raw.turnEpoch >= 0 ? raw.turnEpoch : null,
   };
 }
 
@@ -169,11 +175,13 @@ export class MatrixRoomHistoryStore {
    * Record one room message. The caller decides the kind ('human', 'command'
    * or 'bot'); non-human and explicitly injected entries are marked as already
    * consumed so they never surface as pending context. Duplicate event ids are
-   * ignored to keep a replayed sync from double-counting an entry.
+   * ignored to keep a replayed sync from double-counting an entry. A turn-bound
+   * send passes `turnKey`/`turnEpoch` — the conversation its Session produced
+   * the bubble for and the session generation that delivered it.
    */
-  append({ roomId, eventId, sender, name, text, ts, threadId, kind = 'human', injected } = {}) {
+  append({ roomId, eventId, sender, name, text, ts, threadId, kind = 'human', injected, turnKey = null, turnEpoch = null } = {}) {
     if (!roomId || typeof eventId !== 'string' || !eventId.trim()) return null;
-    const entry = normalizeEntry({ eventId, sender, name, text, ts, threadId, kind, injected });
+    const entry = normalizeEntry({ eventId, sender, name, text, ts, threadId, kind, injected, turnKey, turnEpoch });
     if (!entry) return null;
     const room = this.#roomEntry(roomId);
     if (room.entries.some((existing) => existing.eventId === entry.eventId)) return null;
@@ -193,7 +201,7 @@ export class MatrixRoomHistoryStore {
    * body. Revising an entry that is not stored yet records it, so the last frame
    * always owns the entry regardless of which frame reaches here first.
    */
-  revise({ roomId, eventId, sender, name, text, ts, threadId, kind = 'bot' } = {}) {
+  revise({ roomId, eventId, sender, name, text, ts, threadId, kind = 'bot', turnKey = null, turnEpoch = null } = {}) {
     if (!roomId || typeof eventId !== 'string' || !eventId.trim()) return false;
     const room = this.#roomEntry(roomId);
     const existing = room.entries.find((entry) => entry.eventId === eventId);
@@ -205,10 +213,14 @@ export class MatrixRoomHistoryStore {
       const nextName = cleanText(name, 256);
       if (nextName) existing.name = nextName;
       if (existing.threadId === null) existing.threadId = cleanText(threadId, 255) || null;
+      // An echo-ingested receipt may have created the entry before the send face
+      // knew its turn; the first frame that carries provenance owns the backfill.
+      if (existing.turnKey === null && typeof turnKey === 'string' && turnKey) existing.turnKey = turnKey;
+      if (existing.turnEpoch === null && Number.isSafeInteger(turnEpoch) && turnEpoch >= 0) existing.turnEpoch = turnEpoch;
       this.#persist();
       return true;
     }
-    return this.append({ roomId, eventId, sender, name, text, ts, threadId, kind }) !== null;
+    return this.append({ roomId, eventId, sender, name, text, ts, threadId, kind, turnKey, turnEpoch }) !== null;
   }
 
   /**

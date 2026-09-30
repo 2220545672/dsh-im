@@ -595,7 +595,7 @@ export class TextHarnessBridge {
         return this.#harness
           .steerActiveTurn(sessionId, text, { owner: this, key }, this.#signal ? { signal: this.#signal } : undefined)
           .then((steered) => (steered
-            ? this.#settleSteeredTurn(author, messageId)
+            ? this.#settleSteeredTurn(author, messageId, key)
             : toQueue()))
           .catch(() => toQueue());
       }
@@ -622,6 +622,18 @@ export class TextHarnessBridge {
     return toQueue();
   }
 
+  /**
+   * Tag a turn's own delivery target with its conversation key so the channel can
+   * retire the resulting bubble from that conversation's ambient window: the text
+   * is in the Session transcript already. Local notices, command output, and
+   * interaction prompts send on unstamped targets and stay readable as room facts.
+   */
+  #turnDeliveryTarget(target, conversationKey) {
+    if (!target || typeof target !== 'object'
+      || typeof conversationKey !== 'string' || !conversationKey) return target;
+    return { ...target, dshTurnKey: conversationKey };
+  }
+
   /** The model-facing body of an auto-steered follow-up, labelled like a turn. */
   #steerTextFor(message, messageId, senderId) {
     const body = cleanText(message.content) || controlTextOf(message);
@@ -643,12 +655,24 @@ export class TextHarnessBridge {
   }
 
   /** A steered message became part of the in-flight turn: settle its receipt. */
-  async #settleSteeredTurn(author, messageId) {
+  async #settleSteeredTurn(author, messageId, key) {
     author.steered += 1;
     if (!this.#state.hasSeen(messageId)) await this.#state.markSeen(messageId);
     this.#status.messagesReceived += 1;
     this.#status.lastMessageAt = new Date().toISOString();
     this.#acceptedMessageIds.delete(messageId);
+    // The steered body now lives in the in-flight turn, just like a folded
+    // coalescer member: the channel retires its bubble from the ambient window
+    // with the turn instead of re-serving text this session has taken in.
+    if (this.#contextHooks?.onSteered) {
+      void Promise.resolve(this.#contextHooks.onSteered({ conversationKey: key, messageId }))
+        .catch((error) => {
+          this.#logger.warn?.(
+            `[dsh-im:${this.#descriptor.key}] could not retire a steered follow-up from the ambient window:`,
+            error?.message ?? error,
+          );
+        });
+    }
     return true;
   }
 
@@ -982,7 +1006,7 @@ export class TextHarnessBridge {
       let streamFinished = false;
       if (this.#thinkingTraces && typeof this.#bot.openThinkingStream === 'function') {
         try {
-          stream = await this.#bot.openThinkingStream(target);
+          stream = await this.#bot.openThinkingStream(this.#turnDeliveryTarget(target, conversationKey));
           thinkingStream = true;
         } catch (error) {
           stream = null;
@@ -995,7 +1019,7 @@ export class TextHarnessBridge {
       if (!stream) {
         if (typeof this.#bot.openDeliveryStream === 'function') {
           try {
-            stream = await this.#bot.openDeliveryStream(target);
+            stream = await this.#bot.openDeliveryStream(this.#turnDeliveryTarget(target, conversationKey));
             semanticStream = true;
           } catch (error) {
             this.#logger.warn?.(
@@ -1005,7 +1029,7 @@ export class TextHarnessBridge {
           }
         } else if (typeof this.#bot.openStream === 'function') {
           try {
-            stream = await this.#bot.openStream(target);
+            stream = await this.#bot.openStream(this.#turnDeliveryTarget(target, conversationKey));
           } catch (error) {
             this.#logger.warn?.(
               `[dsh-im:${this.#descriptor.key}] unable to start a streamed reply; using text:`,
@@ -1203,12 +1227,13 @@ export class TextHarnessBridge {
       }
       if (!streamFinished) {
         try {
+          const answerTarget = this.#turnDeliveryTarget(target, conversationKey);
           const result = typeof this.#bot.sendDelivery === 'function'
             ? await this.#bot.sendDelivery(
-                target,
+                answerTarget,
                 createTextDeliveryBlock(visibleAnswer, answerFormat),
               )
-            : await this.#bot.sendText(target, visibleAnswer);
+            : await this.#bot.sendText(answerTarget, visibleAnswer);
           textReceipt = createDeliveryReceipt({
             deliveryId: messageId,
             presentation: result?.presentation ?? `${this.#descriptor.key}-text`,

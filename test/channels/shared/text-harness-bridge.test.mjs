@@ -3942,3 +3942,107 @@ test('a direct-chat non-answer to a pending choice goes unanswered without a top
   gate.resolve();
   await Promise.all([first, bridge.waitForIdle()]);
 });
+
+test('a steered follow-up is retired from the ambient window through the context hook', async () => {
+  const fixture = stateFixture({ 'group:room-steer-hook': 'session-steer-hook' });
+  const prompts = [];
+  const sent = [];
+  const steers = [];
+  const retired = [];
+  const gate = deferred();
+  let askEntered = () => {};
+  const entered = new Promise((resolve) => { askEntered = resolve; });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(text); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-steer-hook',
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        askEntered();
+        await gate.promise;
+        return '首轮答案';
+      },
+      steerActiveTurn: async (_sessionId, text) => {
+        steers.push(text);
+        return true;
+      },
+    },
+    contextHooks: {
+      onSteered: async ({ conversationKey, messageId }) => {
+        retired.push({ conversationKey, messageId });
+      },
+    },
+    logger: { warn() {}, error() {} },
+    autoSteerSameSender: true,
+    autoSteerLimit: 5,
+  });
+  const room = (id, content) => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-steer-hook',
+    speakerName: 'rjd',
+  });
+  const first = bridge.accept(room('steer-hook-first', '原问题'));
+  await within(entered, 1_000, 'the first turn never reached the harness');
+  const followUp = bridge.accept(room('steer-hook-follow', '补充一句约束'));
+  await eventually(() => steers.length === 1);
+  gate.resolve();
+  await Promise.all([first, followUp, bridge.waitForIdle()]);
+  await eventually(() => retired.length === 1);
+  assert.deepEqual(retired[0], { conversationKey: 'group:room-steer-hook', messageId: 'steer-hook-follow' },
+    'the channel learns exactly which bubble the in-flight turn has already taken in');
+});
+
+test('an over-budget follow-up that falls back to the queue stays readable in the ambient window', async () => {
+  const fixture = stateFixture({ 'group:room-budget-hook': 'session-budget-hook' });
+  const prompts = [];
+  const steers = [];
+  const retired = [];
+  const gate = deferred();
+  let askEntered = () => {};
+  const entered = new Promise((resolve) => { askEntered = resolve; });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async () => undefined },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-budget-hook',
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        askEntered();
+        await gate.promise;
+        return '答';
+      },
+      steerActiveTurn: async (_sessionId, text) => {
+        steers.push(text);
+        return true;
+      },
+    },
+    contextHooks: {
+      onSteered: async ({ conversationKey, messageId }) => {
+        retired.push({ conversationKey, messageId });
+      },
+    },
+    logger: { warn() {}, error() {} },
+    autoSteerSameSender: true,
+    autoSteerLimit: 1,
+  });
+  const room = (id, content) => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-budget-hook',
+    speakerName: 'rjd',
+  });
+  const first = bridge.accept(room('budget-hook-first', '原问题'));
+  await within(entered, 1_000, 'the first turn never reached the harness');
+  const steeredTurn = bridge.accept(room('budget-hook-one', '第一次补充'));
+  await eventually(() => steers.length === 1);
+  const capped = bridge.accept(room('budget-hook-two', '超限的补充'));
+  gate.resolve();
+  await Promise.all([first, steeredTurn, capped, bridge.waitForIdle()]);
+  await eventually(() => retired.length === 1);
+  assert.deepEqual(retired, [{ conversationKey: 'group:room-budget-hook', messageId: 'budget-hook-one' }],
+    'only the steered bubble is retired; the queued follow-up still owes its own turn and stays in the window');
+});

@@ -333,6 +333,13 @@ export class MatrixRuntime {
    * collected item, which is harmless for the session.
    */
   #contextLedger = new Map();
+  /**
+   * Per-conversation session generation, bumped when /new clears the session. A
+   * recorded bubble's epoch retires it from its own conversation's window only
+   * while it matches this counter, so a fresh session re-reads the previous
+   * session's bubbles once instead of inheriting their retirement.
+   */
+  #turnEpochs = new Map();
   #ledgerRouteCap = 400;
   #ledgerEntryCap = 512;
   /**
@@ -988,6 +995,12 @@ export class MatrixRuntime {
           });
           for (const record of window) {
             if (this.#contextAlreadyInjected(conversationKey, record.eventId)) continue;
+            // What this conversation's own current session produced already sits in
+            // its transcript; re-serving it as room speech duplicates the model's
+            // own words. Other conversations and a since-cleared session (newer
+            // epoch) keep reading the bubble — its root-bubble panel role survives.
+            if (record.turnKey === conversationKey
+              && record.turnEpoch === (this.#turnEpochs.get(conversationKey) ?? 0)) continue;
             if (!offer({
               collector: 'room-visible',
               roomId,
@@ -1053,9 +1066,22 @@ export class MatrixRuntime {
           this.#markContextInjected(conversationKey, collected.map((entry) => entry.eventId).filter(Boolean));
         }
       },
+      /**
+       * The steered body reached the Session inside the in-flight turn, exactly
+       * like a folded coalescer member: retire its bubble with the turn so the
+       * window never re-serves text the same session has already taken in.
+       */
+      onSteered: async ({ conversationKey, messageId }) => {
+        if (typeof messageId === 'string' && messageId) {
+          this.#markContextInjected(conversationKey, [messageId]);
+        }
+      },
       onSessionCleared: async (conversationKey) => {
         await this.#rootRegistry.clearRoute(conversationKey);
         this.#contextLedger.delete(conversationKey);
+        // The successor session never saw the previous one's answers; bumping the
+        // generation lifts their retirement so they read back into this window once.
+        this.#turnEpochs.set(conversationKey, (this.#turnEpochs.get(conversationKey) ?? 0) + 1);
       },
       onDelivered: async ({ conversationKey, sessionId, providerMessageIds }) => {
         this.#recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds });
@@ -1087,11 +1113,12 @@ export class MatrixRuntime {
   // One recorded bot message, from any exit that reaches the room: a plain
   // send, an edit frame of a streamed answer, or an echoed timeline event.
   // The pending placeholder carries no content and stays out of the record.
-  #recordBotRoomMessage({ roomId, eventId, text, threadId = null, edit = false }) {
+  #recordBotRoomMessage({ roomId, eventId, text, threadId = null, edit = false, turnKey = null }) {
     if (!this.#roomHistory || !this.#roomContextEnabled || !this.#visibleContextEnabled) return;
     if (this.#dmRooms.has(roomId)) return;
     const body = typeof text === 'string' ? text.trim() : '';
     if (!eventId) return;
+    const turnEpoch = turnKey === null ? null : (this.#turnEpochs.get(turnKey) ?? 0);
     const self = this.#botUserId ?? '';
     const name = self ? this.#resolveSenderDisplayName(roomId, self) : null;
     const ts = Date.now();
@@ -1099,14 +1126,14 @@ export class MatrixRuntime {
     // renders an empty entry, while the fork policy and the final edit frames
     // (which revise the same entry to the read body) both key off this id.
     if (!body || body === t('正在处理…')) {
-      this.#roomHistory.append({ roomId, eventId, sender: self, name, text: '', ts, threadId, kind: 'bot' });
+      this.#roomHistory.append({ roomId, eventId, sender: self, name, text: '', ts, threadId, kind: 'bot', turnKey, turnEpoch });
       return;
     }
     if (edit) {
-      this.#roomHistory.revise({ roomId, eventId, sender: self, name, text: body, ts, threadId });
+      this.#roomHistory.revise({ roomId, eventId, sender: self, name, text: body, ts, threadId, turnKey, turnEpoch });
       return;
     }
-    this.#roomHistory.append({ roomId, eventId, sender: self, name, text: body, ts, threadId, kind: 'bot' });
+    this.#roomHistory.append({ roomId, eventId, sender: self, name, text: body, ts, threadId, kind: 'bot', turnKey, turnEpoch });
   }
 
   // The timeline face of bot authorship: kept for homeservers that echo bot
@@ -1375,6 +1402,11 @@ export class MatrixRuntime {
     };
   }
 
+  /** The conversation key a turn-bound delivery target was stamped with, or null for a local send. */
+  #targetTurnKey(target) {
+    return typeof target?.dshTurnKey === 'string' && target.dshTurnKey ? target.dshTurnKey : null;
+  }
+
   async #sendRoomText(target, text, options = {}) {
     const api = this.#api;
     if (!api) throw new Error('Matrix bot is not connected');
@@ -1411,7 +1443,7 @@ export class MatrixRuntime {
       // back onto the timeline, so the room-visible store is fed here too and
       // coalesces with any echo a different server does deliver.
       if (options.recordRoom !== false) {
-        this.#recordBotRoomMessage({ roomId, eventId: result?.event_id, text: chunk, threadId });
+        this.#recordBotRoomMessage({ roomId, eventId: result?.event_id, text: chunk, threadId, turnKey: this.#targetTurnKey(target) });
       }
     }
     return { providerMessageIds };
@@ -1446,8 +1478,10 @@ export class MatrixRuntime {
         }
         await this.#sendRoomEvent(roomId, 'm.room.message', content);
         // Every edit frame revises the same entry, so the store ends holding the
-        // final body members read in the room regardless of frame count.
-        this.#recordBotRoomMessage({ roomId, eventId: streamMessageId, text, threadId, edit: true });
+        // final body members read in the room regardless of frame count. The turn
+        // stamp rides the same target the stream opened under, so the placeholder
+        // receipt and its final body share one provenance.
+        this.#recordBotRoomMessage({ roomId, eventId: streamMessageId, text, threadId, edit: true, turnKey: this.#targetTurnKey(target) });
       },
       sendRemainder: async (chunk) => await this.#sendRoomText(target, chunk),
       messageIdForResult: (result) => result?.providerMessageIds?.at(-1) ?? null,
