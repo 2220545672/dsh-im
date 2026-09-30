@@ -169,6 +169,13 @@ test('a thread window holds its root bubble even when the root was sent on the m
     ['根回答'], 'the thread window includes the root bubble stored on the mainline');
   deepStrictEqual(store.recent({ roomId: '!room:example.org', threadId: null, limit: 10 }).map((entry) => entry.text),
     ['根回答'], 'the mainline window keeps the root on the list it was sent to');
+  // The panel heads with the root however long the thread has been running: an
+  // aged root still leads a fresh window while stale in-panel posts stay out.
+  store.append(ev({ text: '陈旧线内消息', threadId: '$root1:example.org', ts: NOW - 20_000 }));
+  store.append(ev({ text: '新鲜线内消息', threadId: '$root1:example.org', ts: NOW - 1_000 }));
+  deepStrictEqual(store.recent({ roomId: '!room:example.org', threadId: '$root1:example.org', limit: 10, sinceTs: NOW - 10_000 }).map((entry) => entry.text),
+    ['根回答', '新鲜线内消息'],
+    'the root bubble is exempt from the freshness floor as the panel head, while stale in-panel posts remain outside the window');
 });
 
 test('revise brings a stored entry to its latest edit frame and records the last frame when nothing is stored', async () => {

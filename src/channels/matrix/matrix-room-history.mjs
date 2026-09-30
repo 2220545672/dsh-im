@@ -300,10 +300,12 @@ export class MatrixRoomHistoryStore {
    * freshness floor, with caller-named events skipped. The window stays inside
    * one message list — the room's mainline (`threadId: null`) or one thread —
    * so messages members cannot read in the current conversation stay out. A
-   * thread window also holds that thread's root bubble: the panel shows the
-   * root message itself, and an answer sent as a reply that opened a thread is
-   * stored on the mainline where it was sent. Pure read — consumption
-   * bookkeeping stays with the caller's per-conversation ledger.
+   * thread window also holds that thread's root bubble: the panel heads with the
+   * root message itself and an answer sent as the reply that opened a thread is
+   * stored on the mainline where it was sent — the root leads the window and is
+   * exempt from the freshness floor, being the panel's permanent head rather
+   * than a recent post. Pure read — consumption bookkeeping stays with the
+   * caller's per-conversation ledger.
    */
   recent({ roomId, threadId = null, exclude = null, limit = 8, maxChars = 4_000, sinceTs = 0 } = {}) {
     const room = this.#value.rooms[roomId];
@@ -315,17 +317,23 @@ export class MatrixRoomHistoryStore {
     const skip = exclude instanceof Set ? exclude : new Set(Array.isArray(exclude) ? exclude : []);
     const selected = [];
     let used = 0;
-    for (let index = room.entries.length - 1; index >= 0 && selected.length < cap; index -= 1) {
+    const rootEntry = wantedThread === null ? null
+      : room.entries.find((entry) => entry.eventId === wantedThread && entry.text && !skip.has(entry.eventId)) ?? null;
+    if (rootEntry) {
+      used += rootEntry.text.length + (rootEntry.name ? rootEntry.name.length + 2 : 1);
+    }
+    for (let index = room.entries.length - 1; index >= 0 && selected.length < (rootEntry ? cap - 1 : cap); index -= 1) {
       const entry = room.entries[index];
-      if ((entry.threadId ?? null) !== wantedThread && !(wantedThread !== null && entry.eventId === wantedThread)) continue;
+      if (rootEntry !== null && entry.eventId === rootEntry.eventId) continue;
+      if ((entry.threadId ?? null) !== wantedThread) continue;
       if (!entry.text) continue;
       if (entry.ts <= floor || skip.has(entry.eventId)) continue;
       const cost = entry.text.length + (entry.name ? entry.name.length + 2 : 1);
-      if (selected.length > 0 && used + cost > charCap) break;
+      if (used + cost > charCap && selected.length > 0) break;
       selected.unshift(entry);
       used += cost;
     }
-    return selected;
+    return rootEntry === null ? selected : [rootEntry, ...selected];
   }
 
   /**
