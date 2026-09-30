@@ -3645,3 +3645,300 @@ test('media payloads neither fold into the window nor ride the auto-steer lane',
   await Promise.all([first, picture, bridge.waitForIdle()]);
   assert.equal(prompts.length, 2, 'the media message keeps its own turn');
 });
+
+test('an addressed change-of-topic from the asking actor arrives as a free-form answer and resolves the waiting', async () => {
+  const fixture = stateFixture({ 'group:room-ask': 'session-ask' });
+  const prompts = [];
+  const sent = [];
+  const responses = [];
+  const gate = deferred();
+  const question = questionInteraction({
+    sessionId: 'session-ask',
+    questions: [{ id: 'q1', question: '请选方向', options: [{ label: '川西' }, { label: '川北' }] }],
+    respond: async (value) => {
+      responses.push(value);
+      return { accepted: true };
+    },
+  });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(text); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-ask',
+      ask: async (_sessionId, prompt, options) => {
+        prompts.push(prompt);
+        await options.onInteraction(question);
+        await gate.promise;
+        return '方向定了';
+      },
+    },
+    logger: { warn() {}, error() {} },
+  });
+  const room = (id, content) => message(id, content, {
+    kind: 'group',
+    conversationId: 'room-ask',
+    speakerName: 'rjd',
+  });
+  const first = bridge.accept(room('ask-first', '帮我定方向'));
+  await eventually(() => sent.some((text) => text.includes('请选方向')));
+  const movedOn = bridge.accept(room('ask-newtopic', '先不管方向，帮我查高铁票'));
+  await eventually(() => responses.length === 1);
+  assert.equal(responses[0]?.ok, true);
+  assert.deepEqual(responses[0]?.value?.answer?.answers, [{
+    id: 'q1',
+    selected: [],
+    custom: '先不管方向，帮我查高铁票',
+  }], 'the asking actor keeps the free-form answer path, so the turn hears the new request instead of hanging');
+  gate.resolve();
+  await Promise.all([first, movedOn, bridge.waitForIdle()]);
+  assert.equal(prompts.length, 1);
+});
+
+test('an addressed answer to the pending choice still answers it', async () => {
+  const fixture = stateFixture({ 'group:room-answer': 'session-answer' });
+  const prompts = [];
+  const sent = [];
+  const responses = [];
+  const gate = deferred();
+  const question = questionInteraction({
+    sessionId: 'session-answer',
+    questions: [{ id: 'q1', question: '请选方向', options: [{ label: '川西' }, { label: '川北' }] }],
+    respond: async (value) => {
+      responses.push(value);
+      return { accepted: true };
+    },
+  });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(text); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-answer',
+      ask: async (_sessionId, prompt, options) => {
+        prompts.push(prompt);
+        await options.onInteraction(question);
+        await gate.promise;
+        return '方向定了';
+      },
+    },
+    logger: { warn() {}, error() {} },
+  });
+  const first = bridge.accept(message('answer-first', '帮我定方向', {
+    kind: 'group',
+    conversationId: 'room-answer',
+    speakerName: 'rjd',
+  }));
+  await eventually(() => sent.some((text) => text.includes('请选方向')));
+  const answer = bridge.accept(message('answer-real', '川西', {
+    kind: 'group',
+    conversationId: 'room-answer',
+    speakerName: 'rjd',
+  }));
+  await eventually(() => responses.length === 1);
+  assert.equal(responses[0]?.ok, true, 'a parseable @ answer still submits as the answer, not as a new turn');
+  assert.deepEqual(responses[0]?.value?.answer?.answers, [{ id: 'q1', selected: ['川西'] }]);
+  gate.resolve();
+  await Promise.all([first, answer, bridge.waitForIdle()]);
+  assert.equal(prompts.length, 1, 'the answered turn continues without opening a second one');
+});
+
+test('another member addressing the bot during a pending question waits in the queue and runs when the turn releases', async () => {
+  const fixture = stateFixture({ 'group:room-other': 'session-other' });
+  const prompts = [];
+  const sent = [];
+  const responses = [];
+  const gate = deferred();
+  const question = questionInteraction({
+    sessionId: 'session-other',
+    questions: [{ id: 'q1', question: '请选方向', options: [{ label: '川西' }] }],
+    respond: async (value) => {
+      responses.push(value);
+      return { accepted: true };
+    },
+  });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(text); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-other',
+      ask: async (_sessionId, prompt, options) => {
+        prompts.push(prompt);
+        if (prompts.length === 1) {
+          await options.onInteraction(question);
+          await gate.promise;
+          return '答';
+        }
+        return '他人答';
+      },
+    },
+    logger: { warn() {}, error() {} },
+  });
+  const first = bridge.accept(message('other-first', '帮我定方向', {
+    kind: 'group',
+    conversationId: 'room-other',
+    speakerName: 'rjd',
+  }));
+  await eventually(() => sent.some((text) => text.includes('请选方向')));
+  const other = bridge.accept(message('other-ask', '帮我订酒店', {
+    kind: 'group',
+    conversationId: 'room-other',
+    senderId: 'actor-b',
+    speakerName: 'kim',
+  }));
+  await new Promise((resolve) => { setTimeout(resolve, 60); });
+  assert.equal(responses.length, 0, 'a question belongs to the asking actor; another sender does not cancel it');
+  assert.equal(prompts.length, 1, 'the other member waits in the queue behind the turn');
+  gate.resolve();
+  await Promise.all([first, other, bridge.waitForIdle()]);
+  assert.equal(responses[0]?.error?.code, 'cancelled', 'the turn ends with its unanswered question safely cancelled');
+  assert.equal(prompts.length, 2, 'the queued request runs as soon as the turn releases');
+  assert.match(prompts[1], /订酒店/);
+});
+
+test('an addressed non-decision during a pending approval rejects the tool call and asks the new one', async () => {
+  const fixture = stateFixture({ 'group:room-appr': 'session-appr' });
+  const prompts = [];
+  const sent = [];
+  const submitted = [];
+  const gate = deferred();
+  const approval = approvalInteraction({
+    sessionId: 'session-appr',
+    respond: async (value) => {
+      submitted.push(value);
+      return { accepted: true };
+    },
+  });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(String(text)); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-appr',
+      ask: async (_sessionId, prompt, options) => {
+        prompts.push(prompt);
+        if (prompts.length === 1) {
+          await options.onInteraction(approval);
+          await gate.promise;
+          return '执行完';
+        }
+        return '新答';
+      },
+    },
+    logger: { warn() {}, error() {} },
+  });
+  const first = bridge.accept(message('appr-first', '跑个命令', {
+    kind: 'group',
+    conversationId: 'room-appr',
+    speakerName: 'rjd',
+  }));
+  await eventually(() => sent.some((text) => text.includes('批准')), 2_000);
+  const movedOn = bridge.accept(message('appr-newtopic', '先别跑了，帮我查天气', {
+    kind: 'group',
+    conversationId: 'room-appr',
+    speakerName: 'rjd',
+  }));
+  await eventually(() => submitted.length >= 1, 2_000);
+  assert.equal(submitted[0]?.value?.outcome, 'rejected');
+  gate.resolve();
+  await Promise.all([first, movedOn, bridge.waitForIdle()]);
+  assert.equal(prompts.length, 2, 'the new request runs instead of waiting on a decision that will not come');
+  assert.match(prompts[1], /查天气/);
+});
+
+test('an exact decision token from the asking actor still decides the pending approval instead of bypassing', async () => {
+  const fixture = stateFixture({ 'group:room-decide': 'session-decide' });
+  const prompts = [];
+  const sent = [];
+  const submitted = [];
+  const gate = deferred();
+  const approval = approvalInteraction({
+    sessionId: 'session-decide',
+    respond: async (value) => {
+      submitted.push(value);
+      return { accepted: true };
+    },
+  });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async (_target, text) => { sent.push(String(text)); } },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-decide',
+      ask: async (_sessionId, prompt, options) => {
+        prompts.push(prompt);
+        await options.onInteraction(approval);
+        await gate.promise;
+        return '执行完';
+      },
+    },
+    logger: { warn() {}, error() {} },
+  });
+  const first = bridge.accept(message('decide-first', '跑个命令', {
+    kind: 'group',
+    conversationId: 'room-decide',
+    speakerName: 'rjd',
+  }));
+  await eventually(() => sent.some((text) => text.includes('批准')), 2_000);
+  const decision = bridge.accept(message('decide-approve', '批准', {
+    kind: 'group',
+    conversationId: 'room-decide',
+    speakerName: 'rjd',
+  }));
+  await eventually(() => submitted.length === 1);
+  assert.equal(submitted[0]?.value?.outcome, 'allowed-once', 'the decision is claimed as the approval decision, not as a new request');
+  assert.equal(prompts.length, 1, 'deciding does not open a second turn');
+  gate.resolve();
+  await Promise.all([first, decision, bridge.waitForIdle()]);
+  assert.equal(prompts.length, 1);
+});
+
+test('a direct-chat non-answer to a pending choice goes unanswered without a topic-change dispatch', async () => {
+  const fixture = stateFixture({ 'direct:dm-ask': 'session-dm-ask' });
+  const prompts = [];
+  const responses = [];
+  const gate = deferred();
+  const question = questionInteraction({
+    sessionId: 'session-dm-ask',
+    questions: [{ id: 'q1', question: '请选方向', options: [{ label: '川西' }] }],
+    respond: async (value) => {
+      responses.push(value);
+      return { accepted: true };
+    },
+  });
+  const bridge = new TextHarnessBridge({
+    descriptor: { key: 'test', label: 'Test' },
+    state: fixture.state,
+    bot: { sendText: async () => undefined },
+    harness: {
+      sessionExists: async () => true,
+      createSession: async () => 'session-dm-ask',
+      ask: async (_sessionId, prompt, options) => {
+        prompts.push(prompt);
+        await options.onInteraction(question);
+        await gate.promise;
+        return '答';
+      },
+    },
+    logger: { warn() {}, error() {} },
+  });
+  const first = bridge.accept(message('dm-first', '帮我定方向'));
+  await eventually(() => prompts.length === 1);
+  await bridge.accept(message('dm-typo', '选项九十九'));
+  await eventually(() => responses.length === 1);
+  assert.equal(responses[0]?.ok, true);
+  assert.deepEqual(responses[0]?.value?.answer?.answers, [{
+    id: 'q1',
+    selected: [],
+    custom: '选项九十九',
+  }], 'a direct chat answers a pending question by free text; nothing is cancelled behind it');
+  assert.equal(prompts.length, 1, 'the free-form answer does not open a new turn either');
+  gate.resolve();
+  await Promise.all([first, bridge.waitForIdle()]);
+});

@@ -229,6 +229,8 @@ export default {
   '正在使用{name}…': 'Using {name}…',
   '已停止。': 'Stopped.',
   '请用文字回答当前问题。': 'Please answer the current question with text.',
+  '已不再等待原有的待回答或待审批，已将其取消，先回应你的新请求。':
+    'The pending question or approval is no longer waited on and has been cancelled; your new request is being answered first.',
   '{label}交互问题发送失败。': 'Failed to send the {label} interaction question.',
   '回答提交失败。': 'Failed to submit the answer.',
   '回答提交失败，请重新发送当前问题的答案。':

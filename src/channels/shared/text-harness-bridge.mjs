@@ -34,7 +34,7 @@ import {
   runPresetCommand,
 } from './preset-command.mjs';
 import { askInWorkspaceSession } from './workspace-session.mjs';
-import { HarnessApprovalQueue } from './harness-approval.mjs';
+import { HarnessApprovalQueue, harnessApprovalDecision } from './harness-approval.mjs';
 import {
   BatchInputManager,
   batchInputBusyMessage,
@@ -439,6 +439,31 @@ export class TextHarnessBridge {
         this.#acceptedMessageIds.delete(messageId);
         this.#commandTasks.delete(task);
       });
+      this.#commandTasks.add(task);
+      return task;
+    }
+    // An addressed plain-text request that is no approve/reject token while only
+    // an approval waits is the sender moving on, not a decision: reject the
+    // waiting tool call and run this message as its own turn, so the room is not
+    // held behind a decision that is not coming. A pending question keeps its
+    // ordinary flow — the asking actor's @ text answers it, and other senders
+    // queue behind the turn (questions belong to the asking actor). Direct chats
+    // keep the plain decide-by-token path; their exits are the commands.
+    const addressedTrigger = normalized.kind === 'group' && normalized.addressed === true
+      && normalized.plainText !== false
+      && !hasInboundImages(normalized) && !hasInboundFiles(normalized)
+      && Boolean(text);
+    if (addressedTrigger && !pending
+      && this.#approvals.hasPending(key) && harnessApprovalDecision(text) === null) {
+      let task;
+      task = this.#retireWaitingInteractions(key, pending)
+        .then(() => this.#bot.sendText(normalized.replyTarget, t('已不再等待原有的待回答或待审批，已将其取消，先回应你的新请求。')))
+        .catch(() => undefined)
+        .then(() => this.#dispatchTrigger(normalized, messageId, senderId, key))
+        .finally(() => {
+          this.#acceptedMessageIds.delete(messageId);
+          this.#commandTasks.delete(task);
+        });
       this.#commandTasks.add(task);
       return task;
     }
@@ -1905,5 +1930,37 @@ export class TextHarnessBridge {
         error,
       );
     }
+  }
+
+  /**
+   * Retire what waits on a human decision in this conversation: the pending
+   * question loses its card and gets the same safe cancellation the recovered
+   * path uses, and active tool approvals are rejected. The caller follows it
+   * with the new request's dispatch, so the room hears the answer instead of
+   * the waiting.
+   */
+  async #retireWaitingInteractions(key, pending) {
+    if (pending) {
+      this.#clearPendingInteraction(key, pending.interactionId);
+      pending.claimedReplyMessageId = null;
+      if (pending.cardMessageId) {
+        await this.#retireInteractionCard(pending.target, pending.cardMessageId);
+        pending.cardMessageId = null;
+      }
+      if (pending.kind === 'question') {
+        try {
+          await this.#respondCancellation(
+            pending.interaction,
+            `The ${this.#descriptor.label} sender moved on to a new request before answering.`,
+          );
+        } catch (error) {
+          this.#logger.warn?.(
+            `[dsh-im:${this.#descriptor.key}] failed to cancel an unanswered pending question:`,
+            error?.message ?? error,
+          );
+        }
+      }
+    }
+    await this.#approvals.rejectRoute(key).catch(() => 0);
   }
 }
