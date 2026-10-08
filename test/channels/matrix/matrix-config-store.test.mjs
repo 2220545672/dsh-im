@@ -23,7 +23,7 @@ async function makeTempDirectory(prefix) {
 }
 
 after(async () => {
-  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true });
+  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 async function freshStore() {

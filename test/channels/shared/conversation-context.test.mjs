@@ -24,7 +24,7 @@ async function makeTempDirectory(prefix) {
 }
 
 test.after(async () => {
-  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true });
+  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 test('conversation key codecs reproduce the established on-disk keys byte for byte', () => {

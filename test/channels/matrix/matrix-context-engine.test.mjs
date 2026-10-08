@@ -29,7 +29,10 @@ async function makeTempDirectory(prefix) {
 }
 
 after(async () => {
-  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true });
+  // Windows transient locks (antivirus, straggling handles) surface as EBUSY on
+  // recursive deletes under the full-suite's 200+ worker concurrency; fs.rm's
+  // built-in retry absorbs them without turning cleanup into a test failure.
+  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 async function eventually(predicate, label = 'condition', timeoutMs = 4_000) {
