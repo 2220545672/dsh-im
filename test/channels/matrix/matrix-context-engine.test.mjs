@@ -752,3 +752,55 @@ test('a fresh session reads back the answers of the session it replaced, once', 
     await context.stop();
   }
 });
+
+test('the self-answer retirement holds on the reply-chain lane as well, while a fresh session still reads the quoted answer once', async () => {
+  const answer = '本会话刚给出的那条天气回答';
+  const events = {};
+  const context = await createContext({
+    withRoomHistory: true,
+    answer,
+    events,
+    config: { replyContextEnabled: true },
+    initialEvents: [groupMessage({ sender: '@alice:example.org', body: addressedBody('第一个问题'), content: mentionContent() })],
+  });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    await eventually(() => sentRoomMessages(context.fake).length > 0, 'the bot answer left the send face');
+    const answerEventId = sentRoomMessages(context.fake)[0].sentEventId;
+    // The homeserver resolves the quoted bubble to its readable final body — the
+    // whole-send shape of an answer delivered as fresh events, where no pending
+    // placeholder receipt truncates the walk and the ledger has never seen it.
+    events[answerEventId] = {
+      type: 'm.room.message',
+      event_id: answerEventId,
+      sender: BOT,
+      origin_server_ts: Date.now(),
+      content: { msgtype: 'm.text', body: answer },
+    };
+    context.fake.pushEvents([groupMessage({
+      sender: '@alice:example.org',
+      body: addressedBody('那穿衣呢'),
+      content: { ...mentionContent(), 'm.relates_to': { 'm.in_reply_to': { event_id: answerEventId } } },
+    })]);
+    await context.waitForPromptCount(2);
+    const bodies = contextBlockBodies(context.harness.prompts[1]);
+    deepStrictEqual(bodies, [],
+      'the quote is a platform fact, but the bubble behind it is this conversation\'s own word of the current generation: transcript content already, so the reply-chain lane holds it out exactly as the room window does');
+    // A cleared conversation no longer claims its predecessor's bubbles: under the
+    // bumped generation the same quote resolves into the fresh session's context.
+    context.fake.pushEvents([groupMessage({ sender: '@alice:example.org', body: '/new' })]);
+    await eventually(() => sentRoomMessages(context.fake).some((call) =>
+      typeof call.content?.body === 'string' && call.content.body.includes('已开启新会话')), 'the /new confirmation');
+    context.fake.pushEvents([groupMessage({
+      sender: '@alice:example.org',
+      body: addressedBody('继续说天气'),
+      content: { ...mentionContent(), 'm.relates_to': { 'm.in_reply_to': { event_id: answerEventId } } },
+    })]);
+    await context.waitForPromptCount(3);
+    ok(contextBlockBodies(context.harness.prompts[2]).some((body) => body.event === answerEventId && body.content === answer),
+      'the successor session never saw that answer, so the quoted bubble reads back into its context once');
+  } finally {
+    await context.stop();
+  }
+});

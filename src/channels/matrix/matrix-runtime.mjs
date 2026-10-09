@@ -806,9 +806,14 @@ export class MatrixRuntime {
     if (!Array.isArray(providerMessageIds) || providerMessageIds.length === 0) return;
     for (const eventId of providerMessageIds) {
       if (typeof eventId !== 'string' || !eventId) continue;
+      const boundKey = typeof conversationKey === 'string' && conversationKey ? conversationKey : null;
       this.#botEventBindings.set(eventId, {
-        conversationKey: typeof conversationKey === 'string' && conversationKey ? conversationKey : null,
+        conversationKey: boundKey,
         sessionId: typeof sessionId === 'string' && sessionId ? sessionId : null,
+        // The session generation live at delivery, the same stamp the room-visible
+        // record carries at the send exit: after /new bumps the epoch, the former
+        // session's bubbles are no longer this conversation's own words.
+        turnEpoch: boundKey ? (this.#turnEpochs.get(boundKey) ?? 0) : null,
         at: Date.now(),
       });
     }
@@ -816,6 +821,23 @@ export class MatrixRuntime {
       const oldest = this.#botEventBindings.keys().next().value;
       this.#botEventBindings.delete(oldest);
     }
+  }
+
+  /**
+   * Whether an event is this conversation's own answer of the current session
+   * generation. Its text is transcript content already, so no collection lane may
+   * re-serve it as room speech, however the trigger reached it. The provenance
+   * rides the delivery binding (`#recordBotEventDelivery`); once `/new` bumps the
+   * generation, the successor conversation no longer claims the bubble and reads
+   * it back through the windows once.
+   */
+  #isOwnCurrentAnswer(conversationKey, eventId) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return false;
+    if (typeof eventId !== 'string' || !eventId) return false;
+    const binding = this.#botEventBindings.get(eventId);
+    if (!binding || binding.conversationKey !== conversationKey) return false;
+    return Number.isSafeInteger(binding.turnEpoch) && binding.turnEpoch >= 0
+      && binding.turnEpoch === (this.#turnEpochs.get(conversationKey) ?? 0);
   }
 
   /**
@@ -965,6 +987,10 @@ export class MatrixRuntime {
           const walkable = receiptAt >= 0 ? chain.slice(receiptAt + 1) : chain;
           for (const node of walkable) {
             if (this.#contextAlreadyInjected(conversationKey, node.eventId)) continue;
+            // The quote is a platform fact, yet the bubble behind it can be this
+            // conversation's own answer of the current generation: transcript
+            // content already, held out of the context as the room window holds it.
+            if (this.#isOwnCurrentAnswer(conversationKey, node.eventId)) continue;
             if (!offer({
               collector: 'reply',
               roomId,
