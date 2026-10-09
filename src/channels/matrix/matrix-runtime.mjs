@@ -327,10 +327,10 @@ export class MatrixRuntime {
   #threadsMode = 'inherit';
   #triggerOnReply = 'never';
   /**
-   * Within one conversation an event enters the model as collected context at
-   * most once. The ledger is process-local (same lifetime class as the delivered
-   * event bindings): after a restart a first turn may re-present one recent
-   * collected item, which is harmless for the session.
+   * Within one conversation an event enters the model as collected context at most
+   * once. The in-memory map rides on the room record's durable per-conversation
+   * ledger (`contextInjected`/`markContextInjected`), so an entry that was already
+   * offered stays retired across restarts; only a cleared session releases it.
    */
   #contextLedger = new Map();
   /**
@@ -802,6 +802,18 @@ export class MatrixRuntime {
     return this.#botEventBindings.get(eventId)?.conversationKey ?? null;
   }
 
+  /**
+   * The conversation's current session generation. A live clear updates the in-memory
+   * counter; after a restart the durable counter in the room record keeps retired
+   * answers retired without a read-back.
+   */
+  #contextEpoch(conversationKey) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return 0;
+    const live = this.#turnEpochs.get(conversationKey);
+    if (Number.isSafeInteger(live) && live >= 0) return live;
+    return this.#roomHistory?.contextEpoch({ conversationKey }) ?? 0;
+  }
+
   #recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds }) {
     if (!Array.isArray(providerMessageIds) || providerMessageIds.length === 0) return;
     for (const eventId of providerMessageIds) {
@@ -813,7 +825,7 @@ export class MatrixRuntime {
         // The session generation live at delivery, the same stamp the room-visible
         // record carries at the send exit: after /new bumps the epoch, the former
         // session's bubbles are no longer this conversation's own words.
-        turnEpoch: boundKey ? (this.#turnEpochs.get(boundKey) ?? 0) : null,
+        turnEpoch: boundKey ? this.#contextEpoch(boundKey) : null,
         at: Date.now(),
       });
     }
@@ -837,7 +849,7 @@ export class MatrixRuntime {
     const binding = this.#botEventBindings.get(eventId);
     if (!binding || binding.conversationKey !== conversationKey) return false;
     return Number.isSafeInteger(binding.turnEpoch) && binding.turnEpoch >= 0
-      && binding.turnEpoch === (this.#turnEpochs.get(conversationKey) ?? 0);
+      && binding.turnEpoch === this.#contextEpoch(conversationKey);
   }
 
   /**
@@ -880,7 +892,8 @@ export class MatrixRuntime {
 
   #contextAlreadyInjected(conversationKey, eventId) {
     if (typeof conversationKey !== 'string' || !conversationKey || typeof eventId !== 'string' || !eventId) return false;
-    return this.#contextLedger.get(conversationKey)?.has(eventId) === true;
+    if (this.#contextLedger.get(conversationKey)?.has(eventId) === true) return true;
+    return this.#roomHistory?.contextInjected({ conversationKey, eventId }) === true;
   }
 
   #markContextInjected(conversationKey, eventIds) {
@@ -905,6 +918,7 @@ export class MatrixRuntime {
         seen.delete(seen.values().next().value);
       }
     }
+    this.#roomHistory?.markContextInjected({ conversationKey, eventIds });
   }
 
   /**
@@ -1026,7 +1040,7 @@ export class MatrixRuntime {
             // own words. Other conversations and a since-cleared session (newer
             // epoch) keep reading the bubble — its root-bubble panel role survives.
             if (record.turnKey === conversationKey
-              && record.turnEpoch === (this.#turnEpochs.get(conversationKey) ?? 0)) continue;
+              && record.turnEpoch === this.#contextEpoch(conversationKey)) continue;
             if (!offer({
               collector: 'room-visible',
               roomId,
@@ -1107,7 +1121,14 @@ export class MatrixRuntime {
         this.#contextLedger.delete(conversationKey);
         // The successor session never saw the previous one's answers; bumping the
         // generation lifts their retirement so they read back into this window once.
-        this.#turnEpochs.set(conversationKey, (this.#turnEpochs.get(conversationKey) ?? 0) + 1);
+        // The durable ledger and the durable generation carry the same reset across a
+        // restart, so the read-back stays bounded to once per conversation instead of
+        // recurring on every reboot.
+        const durable = this.#roomHistory ? this.#roomHistory.bumpContextEpoch({ conversationKey }) : null;
+        this.#turnEpochs.set(conversationKey, Number.isSafeInteger(durable) && durable > 0
+          ? durable
+          : (this.#turnEpochs.get(conversationKey) ?? 0) + 1);
+        this.#roomHistory?.clearContextInjected({ conversationKey });
       },
       onDelivered: async ({ conversationKey, sessionId, providerMessageIds }) => {
         this.#recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds });
@@ -1144,7 +1165,7 @@ export class MatrixRuntime {
     if (this.#dmRooms.has(roomId)) return;
     const body = typeof text === 'string' ? text.trim() : '';
     if (!eventId) return;
-    const turnEpoch = turnKey === null ? null : (this.#turnEpochs.get(turnKey) ?? 0);
+    const turnEpoch = turnKey === null ? null : this.#contextEpoch(turnKey);
     const self = this.#botUserId ?? '';
     const name = self ? this.#resolveSenderDisplayName(roomId, self) : null;
     const ts = Date.now();

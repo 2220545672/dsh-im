@@ -1,5 +1,5 @@
 import test, { after } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { deepStrictEqual, equal, ok } from 'node:assert';
@@ -186,4 +186,57 @@ test('revise brings a stored entry to its latest edit frame and records the last
   const entries = store.recent({ roomId: '!room:example.org', threadId: '$t9:example.org', limit: 10 });
   deepStrictEqual(entries.map((entry) => [entry.text, entry.kind, entry.ts]), [['终帧正文', 'bot', NOW]],
     'the last frame owns the entry and earlier frames do not linger as siblings');
+});
+
+test('the context ledger is durable: injections and session generations survive a reload', async () => {
+  const directory = await tempDir();
+  const file = join(directory, 'history.json');
+  const conv = 'group:room:!room:example.org';
+  const store = await new MatrixRoomHistoryStore(file).load();
+  equal(store.contextEpoch({ conversationKey: conv }), 0, 'an unknown conversation sits on generation zero');
+  equal(store.contextInjected({ conversationKey: conv, eventId: '$g:x.org' }), false);
+  equal(store.markContextInjected({ conversationKey: conv, eventIds: ['$g:x.org', '$g:x.org', '', 7] }), true,
+    'first-time ids are recorded, duplicates and non-strings are dropped');
+  equal(store.contextInjected({ conversationKey: conv, eventId: '$g:x.org' }), true);
+  equal(store.markContextInjected({ conversationKey: conv, eventIds: ['$g:x.org'] }), false,
+    're-marking an already-marked event changes nothing');
+  equal(store.bumpContextEpoch({ conversationKey: conv }), 1);
+  await store.flush();
+  const reloaded = await new MatrixRoomHistoryStore(file).load();
+  equal(reloaded.contextInjected({ conversationKey: conv, eventId: '$g:x.org' }), true,
+    'the read-once retirement survives a restart, so a reboot re-offers no collected entry');
+  equal(reloaded.contextEpoch({ conversationKey: conv }), 1,
+    'the session generation survives too, so retired answers stay retired for their own conversation');
+  equal(reloaded.clearContextInjected({ conversationKey: conv }), true,
+    'a cleared conversation releases its records so the successor reads each bubble back once');
+  equal(reloaded.contextInjected({ conversationKey: conv, eventId: '$g:x.org' }), false);
+  equal(reloaded.contextEpoch({ conversationKey: conv }), 1, 'clearing the records keeps the generation counter');
+  equal(reloaded.clearContextInjected({ conversationKey: conv }), false, 'an empty record clears to nothing');
+  equal(reloaded.contextEpoch({}), 0);
+  equal(reloaded.contextInjected({}), false);
+  equal(reloaded.markContextInjected({ conversationKey: conv, eventIds: 'nope' }), false);
+});
+
+test('loading stamps provenance on unprovenanced bot bubbles from their own room and thread route', async () => {
+  const directory = await tempDir();
+  const file = join(directory, 'history.json');
+  const roomId = '!room:example.org';
+  const bot = '@bot:example.org';
+  const rows = [
+    { eventId: '$g:x.org', sender: bot, name: 'bot', text: '群聊开场白', ts: NOW, threadId: null, kind: 'bot', injected: true },
+    { eventId: '$t:x.org', sender: bot, name: 'bot', text: '列头回答', ts: NOW, threadId: '$h:x.org', kind: 'bot', injected: true },
+    { eventId: '$r:x.org', sender: bot, name: 'bot', text: '', ts: NOW, threadId: null, kind: 'bot', injected: true },
+    { eventId: '$s:x.org', sender: bot, name: 'bot', text: '已钉者', ts: NOW, threadId: null, kind: 'bot', injected: true, turnKey: 'custom:key', turnEpoch: 4 },
+    { eventId: '$u:x.org', sender: '@alice:example.org', name: 'alice', text: '人的话', ts: NOW, threadId: null, kind: 'human' },
+  ];
+  await writeFile(file, `${JSON.stringify({ rooms: { [roomId]: { entries: rows, injected: [] } } })}\n`, 'utf8');
+  const store = await new MatrixRoomHistoryStore(file).load();
+  const byId = new Map(store.search({ roomId, limit: 50 }).map((entry) => [entry.eventId, entry]));
+  equal(byId.get('$g:x.org').turnKey, `group:room:${roomId}`, 'a mainline bubble names the room conversation that delivered it');
+  equal(byId.get('$g:x.org').turnEpoch, 0);
+  equal(byId.get('$t:x.org').turnKey, `group:room:${roomId}$$h:x.org`, 'a threaded bubble names its panel conversation');
+  equal(byId.get('$r:x.org').turnKey, null, 'a content-free receipt keeps no claim');
+  equal(byId.get('$s:x.org').turnKey, 'custom:key');
+  equal(byId.get('$s:x.org').turnEpoch, 4, 'an entry that already names its delivery keeps its stamp');
+  equal(byId.get('$u:x.org').turnKey, null, 'human entries gain no bot provenance');
 });

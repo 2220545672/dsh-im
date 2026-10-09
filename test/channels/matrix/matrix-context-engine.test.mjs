@@ -181,7 +181,7 @@ function loggerStub() {
   };
 }
 
-async function createContext({ config = {}, initialEvents = [], events = {}, withRoomHistory = false, answer } = {}) {
+async function createContext({ config = {}, initialEvents = [], events = {}, withRoomHistory = false, answer, historyFile = null } = {}) {
   const directory = await makeTempDirectory('dsh-im-matrix-context-');
   const sidecar = await new MatrixSidecarStore(join(directory, 'matrix.json')).load();
   const state = stateStub();
@@ -191,8 +191,8 @@ async function createContext({ config = {}, initialEvents = [], events = {}, wit
     ? { next_batch: 'b0', rooms: { join: { [ROOM]: { timeline: { events: initialEvents } } } } }
     : { next_batch: 'b0' };
   const fake = createFakeApi({ initial, events });
-  const historyFile = join(directory, 'matrix-history.json');
-  const roomHistory = withRoomHistory ? await new MatrixRoomHistoryStore(historyFile).load() : null;
+  const historyPath = historyFile ?? join(directory, 'matrix-history.json');
+  const roomHistory = withRoomHistory ? await new MatrixRoomHistoryStore(historyPath).load() : null;
   const accessPolicy = {
     getSettings: () => ({
       direct: { mode: 'open', open: { defaultCanExecuteCommands: true, commandPermissionOverrides: [] }, allowlist: { users: [] } },
@@ -227,7 +227,7 @@ async function createContext({ config = {}, initialEvents = [], events = {}, wit
     fake.drainPendings();
   };
   const waitForPromptCount = (count) => eventually(() => harness.prompts.length >= count, `${count} prompts`);
-  return { runtime, fake, state, harness, logger, sidecar, roomHistory, historyFile, stop, waitForPromptCount };
+  return { runtime, fake, state, harness, logger, sidecar, roomHistory, historyFile: historyPath, stop, waitForPromptCount };
 }
 
 const sentRoomMessages = (fake) => fake.calls.filter((call) => call.op === 'send' && call.type === 'm.room.message');
@@ -802,5 +802,42 @@ test('the self-answer retirement holds on the reply-chain lane as well, while a 
       'the successor session never saw that answer, so the quoted bubble reads back into its context once');
   } finally {
     await context.stop();
+  }
+});
+
+test('the room window read-once retirement survives a restarted runtime, and a cleared conversation reads the entry back once', async () => {
+  const now = Date.now();
+  const context = await createContext({ withRoomHistory: true });
+  try {
+    await context.runtime.start();
+    context.roomHistory.append({ roomId: ROOM, eventId: '$side:x.org', sender: '@carol:example.org', name: 'carol', text: '旁人的留言', ts: now - 40_000 });
+    context.fake.pushEvents([groupMessage({ sender: '@alice:example.org', body: addressedBody('首问'), content: mentionContent() })]);
+    await context.waitForPromptCount(1);
+    ok(contextBlockBodies(context.harness.prompts[0]).some((entry) => entry.content === '旁人的留言'),
+      'the room-visible window offers the unaddressed bubble to the first question');
+    await eventually(() => context.roomHistory.contextInjected({ conversationKey: MAIN_KEY, eventId: '$side:x.org' }),
+      'the consumption marker reaches the durable ledger with the successful turn');
+    await context.roomHistory.flush();
+  } finally {
+    await context.stop();
+  }
+  const revived = await createContext({ withRoomHistory: true, historyFile: context.historyFile });
+  try {
+    await revived.runtime.start();
+    revived.fake.pushEvents([groupMessage({ sender: '@bob:example.org', body: addressedBody('重启后的提问'), content: mentionContent() })]);
+    await revived.waitForPromptCount(1);
+    ok(!contextBlockBodies(revived.harness.prompts[0]).some((entry) => entry.content === '旁人的留言'),
+      'the restarted runtime re-offers nothing its conversation has already been shown: the ledger is durable, not process-local');
+    revived.fake.pushEvents([groupMessage({ sender: '@bob:example.org', body: '/new' })]);
+    await eventually(() => sentRoomMessages(revived.fake).some((call) =>
+      typeof call.content?.body === 'string' && call.content.body.includes('已开启新会话')), 'the /new confirmation');
+    revived.fake.pushEvents([groupMessage({ sender: '@bob:example.org', body: addressedBody('新会话首问'), content: mentionContent() })]);
+    await revived.waitForPromptCount(2);
+    ok(contextBlockBodies(revived.harness.prompts[1]).some((entry) => entry.content === '旁人的留言'),
+      'the cleared conversation releases the retirement, so the successor session reads the bubble back once');
+    await eventually(() => revived.roomHistory.contextInjected({ conversationKey: MAIN_KEY, eventId: '$side:x.org' }),
+      'the read-back is recorded in the durable ledger again');
+  } finally {
+    await revived.stop();
   }
 });

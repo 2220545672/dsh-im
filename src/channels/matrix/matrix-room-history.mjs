@@ -16,6 +16,8 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
+import { buildConversationRoute, encodeConversationRouteKey } from '../shared/conversation/route.mjs';
+
 export const DEFAULT_ROOM_HISTORY_LIMIT = 2_000;
 export const MIN_ROOM_HISTORY_LIMIT = 20;
 export const MAX_ROOM_HISTORY_LIMIT = 50_000;
@@ -25,6 +27,8 @@ export const MIN_ROOM_CONTEXT_CHARS = 200;
 export const MAX_ROOM_CONTEXT_CHARS = 200_000;
 const ENTRY_TEXT_CHARS = 4_000;
 const INJECTED_EVENT_MAX = 1_000;
+const CONTEXT_LEDGER_ROUTE_MAX = 400;
+const CONTEXT_LEDGER_ENTRY_MAX = 1_000;
 
 export function matrixRoomHistoryPathFor(botDir) {
   return `${botDir}/matrix-history.json`;
@@ -96,18 +100,36 @@ function normalizeEntry(raw) {
   };
 }
 
+// A recorded bot bubble missing its provenance stamp was delivered before that stamp
+// existed; its own room and thread name the route it was delivered under. Repair the
+// stamp at load so the runtime's self-answer guard retires the bubble from that
+// conversation's windows again after a restart. The healed generation is the first one
+// (0): a conversation that cleared its session still reads the bubble back once.
+function healBotProvenance(entries, roomId) {
+  for (const entry of entries) {
+    if (entry.kind !== 'bot' || entry.turnKey !== null || !entry.text) continue;
+    entry.turnKey = encodeConversationRouteKey(buildConversationRoute({
+      channel: 'matrix', chatId: roomId, threadId: entry.threadId, kind: 'group',
+    }));
+    entry.turnEpoch = 0;
+  }
+}
+
 /**
  * Durable, bounded, per-room message record. Entries are kept in arrival order
  * (the runtime feeds the sync timeline, which is chronological per room). Each
  * room is trimmed to `limit` most-recent entries and injected-event markers are
- * pruned against the live entries so growth stays bounded. Writes are serialized
+ * pruned against the live entries so growth stays bounded. A durable per-conversation
+ * collection ledger (`ledgers`) records which events each conversation has already been
+ * offered as context, together with the session generation that retired them, so the
+ * read-once retirement survives a restart. Writes are serialized
  * through an in-memory queue with an atomic temp-file rename, mirroring the
  * Matrix sidecar.
  */
 export class MatrixRoomHistoryStore {
   #path;
   #limit;
-  #value = { rooms: Object.create(null) };
+  #value = { rooms: Object.create(null), ledgers: Object.create(null) };
   #writeQueue = Promise.resolve();
 
   constructor(path, { limit = DEFAULT_ROOM_HISTORY_LIMIT } = {}) {
@@ -133,9 +155,27 @@ export class MatrixRoomHistoryStore {
           const injected = new Set((Array.isArray(room.injected) ? room.injected : [])
             .filter((id) => typeof id === 'string' && id));
           rooms[roomId] = { entries, injected };
+          healBotProvenance(entries, roomId);
         }
       }
-      this.#value = { rooms };
+      const ledgers = Object.create(null);
+      if (parsed && typeof parsed === 'object' && parsed.ledgers && typeof parsed.ledgers === 'object') {
+        for (const [conversationKey, ledger] of Object.entries(parsed.ledgers)) {
+          if (!conversationKey || !ledger || typeof ledger !== 'object') continue;
+          const epoch = Number.isSafeInteger(ledger.epoch) && ledger.epoch >= 0 ? ledger.epoch : 0;
+          const seen = new Set();
+          const injected = [];
+          for (const eventId of Array.isArray(ledger.injected) ? ledger.injected : []) {
+            if (typeof eventId !== 'string' || !eventId || seen.has(eventId)) continue;
+            seen.add(eventId);
+            injected.push(eventId);
+          }
+          ledgers[conversationKey] = { epoch, injected: injected.slice(-CONTEXT_LEDGER_ENTRY_MAX) };
+        }
+        const keys = Object.keys(ledgers);
+        for (let index = 0; index < keys.length - CONTEXT_LEDGER_ROUTE_MAX; index += 1) delete ledgers[keys[index]];
+      }
+      this.#value = { rooms, ledgers };
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
@@ -151,6 +191,20 @@ export class MatrixRoomHistoryStore {
     return room;
   }
 
+  #ledgerEntry(conversationKey) {
+    let ledger = this.#value.ledgers[conversationKey];
+    if (ledger) return ledger;
+    ledger = { epoch: 0, injected: [] };
+    this.#value.ledgers[conversationKey] = ledger;
+    const keys = Object.keys(this.#value.ledgers);
+    for (let index = 0; index < keys.length - CONTEXT_LEDGER_ROUTE_MAX; index += 1) {
+      const oldest = keys[index];
+      if (oldest === conversationKey && keys.length === 1) break;
+      delete this.#value.ledgers[oldest];
+    }
+    return ledger;
+  }
+
   #persist() {
     const rooms = Object.create(null);
     for (const [roomId, room] of Object.entries(this.#value.rooms)) {
@@ -160,7 +214,12 @@ export class MatrixRoomHistoryStore {
         injected: [...room.injected].slice(-INJECTED_EVENT_MAX),
       };
     }
-    const snapshot = JSON.stringify({ rooms }, null, 2);
+    const ledgers = Object.create(null);
+    for (const [conversationKey, ledger] of Object.entries(this.#value.ledgers)) {
+      if (ledger.epoch === 0 && ledger.injected.length === 0) continue;
+      ledgers[conversationKey] = { epoch: ledger.epoch, injected: ledger.injected.slice(-CONTEXT_LEDGER_ENTRY_MAX) };
+    }
+    const snapshot = JSON.stringify({ rooms, ledgers }, null, 2);
     const operation = this.#writeQueue.then(async () => {
       await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
       const temporary = `${this.#path}.tmp`;
@@ -366,6 +425,67 @@ export class MatrixRoomHistoryStore {
     }
     if (marked > 0) this.#persist();
     return marked;
+  }
+
+  /**
+   * Durable counterpart of the runtime's per-conversation injection ledger: within one
+   * conversation an event enters the model as collected context at most once, and that
+   * once must outlive the process. The session generation rides the same record, so an
+   * answer retired under a live generation is not read back merely because the process
+   * restarted; only a cleared session lifts the retirement.
+   */
+  contextEpoch({ conversationKey } = {}) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return 0;
+    return this.#value.ledgers[conversationKey]?.epoch ?? 0;
+  }
+
+  /** Advance one conversation's durable generation (its session was cleared); returns the new value. */
+  bumpContextEpoch({ conversationKey } = {}) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return 0;
+    const ledger = this.#ledgerEntry(conversationKey);
+    ledger.epoch += 1;
+    this.#persist();
+    return ledger.epoch;
+  }
+
+  /** Whether one event was already injected into one conversation's collected context. */
+  contextInjected({ conversationKey, eventId } = {}) {
+    if (typeof conversationKey !== 'string' || !conversationKey || typeof eventId !== 'string' || !eventId) return false;
+    const ledger = this.#value.ledgers[conversationKey];
+    return ledger ? ledger.injected.includes(eventId) : false;
+  }
+
+  /** Record events as injected into one conversation; the most recent entries are kept when the bound binds. */
+  markContextInjected({ conversationKey, eventIds } = {}) {
+    if (typeof conversationKey !== 'string' || !conversationKey || !Array.isArray(eventIds)) return false;
+    const ledger = this.#ledgerEntry(conversationKey);
+    const seen = new Set(ledger.injected);
+    let marked = 0;
+    for (const eventId of eventIds) {
+      if (typeof eventId !== 'string' || !eventId || seen.has(eventId)) continue;
+      seen.add(eventId);
+      ledger.injected.push(eventId);
+      marked += 1;
+    }
+    if (marked === 0) return false;
+    if (ledger.injected.length > CONTEXT_LEDGER_ENTRY_MAX) {
+      ledger.injected.splice(0, ledger.injected.length - CONTEXT_LEDGER_ENTRY_MAX);
+    }
+    // Recency follows the last offer, so the route cap evicts the stalest conversation.
+    delete this.#value.ledgers[conversationKey];
+    this.#value.ledgers[conversationKey] = ledger;
+    this.#persist();
+    return true;
+  }
+
+  /** Release one conversation's injected records: its cleared successor session reads each bubble back once. */
+  clearContextInjected({ conversationKey } = {}) {
+    if (typeof conversationKey !== 'string' || !conversationKey) return false;
+    const ledger = this.#value.ledgers[conversationKey];
+    if (!ledger || ledger.injected.length === 0) return false;
+    ledger.injected = [];
+    this.#persist();
+    return true;
   }
 
   /** Drop a room record entirely (used when a room is removed/reset). */
