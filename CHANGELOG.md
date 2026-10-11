@@ -6,6 +6,31 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [4.38.1] - 2026-10-12
+
+### Fixed / 修复
+
+- 修复双向 Session 同步中助手最终答复的 Markdown 丢失问题，按各 IM 渠道能力发送富文本、原生 Markdown 或保留完整正文的纯文本；用户消息回显仍为纯文本。长消息按渠道限制分片并补齐代码围栏，新增格式降级仅针对明确被拒绝的分片，不重发成功分片或为不确定结果新增重试；飞书保留原有镜像卡与纯文本兜底。（[#339](https://github.com/xmanrui/dsh-im/issues/339)）
+  Bidirectional Session sync preserves Markdown in final assistant answers using each IM channel's rich text, native Markdown, or full-text fallback, while user echoes remain plain text. Long messages respect channel limits and repair code fences. New format fallbacks target only explicitly rejected chunks, without replaying successful chunks or adding retries for uncertain outcomes. Feishu retains its existing mirror cards and plain-text fallback. ([#339](https://github.com/xmanrui/dsh-im/issues/339))
+- 企业微信机器人将引用消息中的图片与当前消息图片一同送入模型，保留图片来源和序号提示；引用图片缺失时明确说明并提示重新发送。本地命令仍不下载引用图片，现有权限、预取队列及图片输入限制保持不变。（[#345](https://github.com/xmanrui/dsh-im/issues/345)）
+  WeCom bots pass quoted images alongside directly attached images to the model, identifying their source and position. Missing quoted images are explicitly reported with a resend request. Local commands do not download quoted images, and existing permissions, prefetch queues, and image-input limits remain unchanged. ([#345](https://github.com/xmanrui/dsh-im/issues/345))
+- 客户端时区无法解析、为空或读取异常时省略可选时区字段，避免普通排队与插话请求被网关拒绝；网关输入校验错误归入协议错误，便于诊断。
+  Queue and steer requests omit the optional client time zone when it is unresolved, empty, or throws, preventing gateway input rejection. Gateway input-validation failures are classified as protocol errors for clearer diagnostics.
+- 主动投递不再将明确未发送、失败或结果未知的返回值误判为成功；微信长消息分片投递在失败时停止后续分片，并保留安全的分片诊断信息。
+  Proactive delivery no longer treats explicit non-delivery, failure, or unknown outcomes as success. Weixin long-message delivery stops remaining chunks on failure and retains safe chunk diagnostics.
+
+### Changed / 变更
+
+- 中英文插件名称统一附加 `(dsh-im)`，同步更新说明文档与截图。
+  Localized plugin names consistently include the `(dsh-im)` suffix, with refreshed documentation and screenshots.
+
+### Notes / 使用说明
+
+- 双向同步范围仍为当前 Host 的已绑定私聊，不扩展到群、话题或远程 Host；WhatsApp 仅转换常见格式，复杂结构保留原文。
+  Bidirectional sync remains limited to bound private chats on the current Host, without adding groups, topics, or remote Hosts. WhatsApp converts common formatting conservatively and preserves unsupported complex structures literally.
+- 依赖声明与 DSH `0.2.0-rc.2` 兼容声明保持不变；升级后重启 Host 并刷新管理页面，以加载同版 Host 和客户端代码。
+  Dependency declarations and declared DSH `0.2.0-rc.2` compatibility remain unchanged. Restart the Host and refresh the management page after upgrading so Host and client code use the same version.
+
 ## [4.38.0] - 2026-10-09
 
 ### Added / 新增
@@ -1670,7 +1695,8 @@ This file records the notable changes in each dsh-im release. Its format follows
 - 改进 npm 发布包结构，保留 CLI 入口并避免安装脚本拦截。
   Improved npm package contents to preserve the CLI entry point and avoid install-script blocking.
 
-[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.38.0...HEAD
+[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.38.1...HEAD
+[4.38.1]: https://github.com/xmanrui/dsh-im/compare/v4.38.0...v4.38.1
 [4.38.0]: https://github.com/xmanrui/dsh-im/compare/v4.37.0...v4.38.0
 [4.37.0]: https://github.com/xmanrui/dsh-im/compare/v4.36.1...v4.37.0
 [4.36.1]: https://github.com/xmanrui/dsh-im/compare/v4.36.0...v4.36.1
