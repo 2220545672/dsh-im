@@ -30,6 +30,9 @@ export default {
   // Bot replies and status text (wecom-bridge.mjs)
 
   '当前待处理图片较多，请稍后重新发送。': 'Too many images are pending. Please send them again later.',
+  '图片 {indexes} 来自当前消息。': 'Images {indexes} are from the current message.',
+  '图片 {indexes} 来自被引用消息。图片序号与本轮附件清单一致。': 'Images {indexes} are from the quoted message. Image numbers match the attachment list for this turn.',
+  '有 {count} 张引用图片未提供可下载资源，未附上这些图片；需要看图时请用户重新发送。': '{count} quoted images have no downloadable resource and are not attached. Ask the user to send them again if needed.',
 
   '结果文件「{name}」已生成，但企业微信智能机器人缺少素材上传或文件消息能力，请检查机器人权限。': 'The result file "{name}" was generated, but the Enterprise WeChat bot lacks media upload or file message capability. Please check the bot permissions.',
   '结果文件「{name}」超过当前企业微信机器人可发送的文件大小，未发送。': 'The result file "{name}" exceeds the file size this Enterprise WeChat bot can send and was not sent.',

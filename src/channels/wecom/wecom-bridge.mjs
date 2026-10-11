@@ -21,6 +21,7 @@ import {
   isBatchInputCommand,
 } from '../shared/batch-input.mjs';
 import { runCompactCommand } from '../shared/compact-command.mjs';
+import { isSharedLocalCommand } from '../shared/command-permission.mjs';
 import { isClearCommand, runClearCommand } from '../shared/clear-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
 import {
@@ -154,10 +155,9 @@ function messageText(frame) {
     : text;
 }
 
-function imageContents(frame) {
-  const body = bodyOf(frame);
-  if (body.msgtype === 'image') return [body.image];
-  if (body.msgtype !== 'mixed' || !Array.isArray(body.mixed?.msg_item)) return [];
+function imageContents(body) {
+  if (body?.msgtype === 'image') return [body.image];
+  if (body?.msgtype !== 'mixed' || !Array.isArray(body.mixed?.msg_item)) return [];
   return body.mixed.msg_item
     .filter((item) => item?.msgtype === 'image')
     .map((item) => item.image);
@@ -259,7 +259,7 @@ export function wecomInboundMessage(frame, client) {
   const replyTo = replyReferenceForBody(body);
   return {
     content: messageText(frame),
-    images: imageContents(frame).map((image) => imageSource(client, image)).filter(Boolean),
+    images: imageContents(body).map((image) => imageSource(client, image)).filter(Boolean),
     files: fileContents(frame).map((file) => fileSource(client, file)).filter(Boolean),
     ...(replyTo ? { replyTo } : {}),
   };
@@ -335,6 +335,25 @@ function imageQueueFullMessage(message) {
       },
     })),
   };
+}
+
+function quotedImageGuidance(message) {
+  const lines = [];
+  const directCount = message.images.length;
+  const quotedCount = message.quotedImages?.length ?? 0;
+  if (quotedCount > 0) {
+    if (directCount > 0) lines.push(t('图片 {indexes} 来自当前消息。', {
+      indexes: Array.from({ length: directCount }, (_, index) => index + 1).join(', '),
+    }));
+    lines.push(t('图片 {indexes} 来自被引用消息。图片序号与本轮附件清单一致。', {
+      indexes: Array.from({ length: quotedCount }, (_, index) => directCount + index + 1).join(', '),
+    }));
+  }
+  if (message.missingQuotedImageCount > 0) lines.push(t(
+    '有 {count} 张引用图片未提供可下载资源，未附上这些图片；需要看图时请用户重新发送。',
+    { count: message.missingQuotedImageCount },
+  ));
+  return lines.join('\n');
 }
 
 function interactionReplyText(frame) {
@@ -1082,19 +1101,33 @@ export class WecomHarnessBridge {
     // may legally stay queued longer. Start the authenticated SDK download as
     // soon as the validated callback is accepted, then consume it in order.
     const inboundMessage = wecomInboundMessage(frame, this.#client);
-    const imageCount = inboundMessage.images.length;
+    const directCount = inboundMessage.images.length;
+    const quoteContents = isSharedLocalCommand(inboundMessage.content, {
+      hasImages: hasInboundImages(inboundMessage),
+      hasFiles: hasInboundFiles(inboundMessage),
+    }) ? [] : imageContents(bodyOf(frame).quote);
+    const quotedImages = quoteContents.map((image) => imageSource(this.#client, image)).filter(Boolean);
+    const combinedMessage = { ...inboundMessage, images: [...inboundMessage.images, ...quotedImages] };
+    const imageCount = combinedMessage.images.length;
     let reservedImages = 0;
-    let preparedMessage = inboundMessage;
+    let preparedMessage = combinedMessage;
     if (imageCount > 0) {
       if (this.#prefetchedImageCount + imageCount <= MAX_PREFETCHED_IMAGES) {
         reservedImages = imageCount;
         this.#prefetchedImageCount += reservedImages;
-        preparedMessage = prefetchInboundImages(inboundMessage, this.#signal,
+        preparedMessage = prefetchInboundImages(combinedMessage, this.#signal,
           this.#harness.getImageInputLimits?.() ?? imageInputLimits());
       } else {
-        preparedMessage = imageQueueFullMessage(inboundMessage);
+        preparedMessage = imageQueueFullMessage(combinedMessage);
       }
     }
+    // Keep quoted media separate until local command and interaction routing is done.
+    preparedMessage = {
+      ...preparedMessage,
+      images: preparedMessage.images.slice(0, directCount),
+      quotedImages: preparedMessage.images.slice(directCount),
+      missingQuotedImageCount: quoteContents.length - quotedImages.length,
+    };
     preparedMessage = prefetchInboundFiles(preparedMessage, this.#signal);
     const previous = this.#queues.get(key) ?? Promise.resolve();
     const current = previous
@@ -1390,6 +1423,8 @@ export class WecomHarnessBridge {
       let content = hasImages || hasReply
         ? await promptContentForInboundMessage(message, { signal: this.#signal, deferImages: true })
         : undefined;
+      const imageGuidance = quotedImageGuidance(message);
+      if (imageGuidance) content.push({ type: 'text', text: imageGuidance });
       const snapshot = this.#acceptedMessageIds.get(messageId);
       let contextEnhanced = false;
       if (snapshot) {
@@ -1440,7 +1475,7 @@ export class WecomHarnessBridge {
           }),
           onInteractionResolved: (resolution) => this.#handleInteractionResolved(resolution),
           files: message.files,
-          images: message.images,
+          images: [...message.images, ...(message.quotedImages ?? [])],
         },
       });
       if (batchSubmission) {
