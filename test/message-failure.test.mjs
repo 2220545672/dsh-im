@@ -139,6 +139,23 @@ test('failure reasons prefer explicit diagnostics and fall back to a safe RPC co
   }
 });
 
+test('gateway input validation failures reuse protocol guidance and retain their reason', (t) => {
+  const language = getImHostLanguage();
+  t.after(() => setImHostLanguage(language));
+  for (const locale of ['zh', 'en']) {
+    setImHostLanguage(locale);
+    const failure = classifyMessageFailure({
+      code: 'gateway/input-invalid', message: 'private boundary validation detail',
+    }, options);
+    assert.equal(failure.code, 'HARNESS_PROTOCOL');
+    assert.equal(failure.reason, 'GATEWAY_INPUT_INVALID');
+    assert.equal(failure.referenceId, options.referenceId);
+    assert.equal(failure.message, classifyMessageFailure({ code: 'harness-response-invalid' }, options).message);
+    assert.doesNotMatch(JSON.stringify(publicMessageFailure(failure)), /private boundary/);
+    assert.match(messageFailureText(failure), /HARNESS_PROTOCOL.*MF-TEST01/s);
+  }
+});
+
 test('diagnostic fallback does not turn an unknown RPC error into invalid input', () => {
   const error = { code: 'gateway/internal' };
   const failure = classifyMessageFailure(error, { ...options, userMessage: '请求失败。' });

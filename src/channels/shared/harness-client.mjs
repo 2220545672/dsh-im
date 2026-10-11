@@ -33,6 +33,18 @@ const MAX_ERROR_CLASSIFICATION_BYTES = 64;
 const IM_INPUT_ORIGIN_TTL_MS = 30 * 60 * 1000;
 const MAX_IM_INPUT_ORIGINS = 4096;
 
+function clientTimeZoneFields() {
+  try {
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof timeZone === 'string' && timeZone.trim()
+      ? { clientTimeZone: timeZone }
+      : {};
+  } catch {
+    // Time-zone metadata is optional; unresolved values are not JSON-safe.
+    return {};
+  }
+}
+
 async function smallResponseText(response) {
   const stream = response?.body;
   if (!stream || typeof stream.getReader !== 'function') return null;
@@ -1621,7 +1633,7 @@ export class HarnessClient {
         sessionId,
         mode: 'steer',
         content: [{ type: 'text', text }],
-        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        ...clientTimeZoneFields(),
       }, 30_000, { ...options, rpcId: inputRpcId });
       return true;
     } catch (error) {
@@ -1890,12 +1902,12 @@ export class HarnessClient {
       // `content`: the prompt also carries whatever the user typed, and a
       // message that merely looks like a guidance block is not configuration.
       imSourceGuidance.publish(sessionId, options.sourceGuidance);
-      const clientTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const timeZoneFields = clientTimeZoneFields();
       const sendPrompt = (promptContent) => this.#sessionRpc('session.prompt', {
         sessionId,
         mode: 'queue',
         content: promptContent,
-        clientTimeZone,
+        ...timeZoneFields,
       }, 30_000, { rpcId: promptRpcId, signal });
       try {
         await sendPrompt(content);

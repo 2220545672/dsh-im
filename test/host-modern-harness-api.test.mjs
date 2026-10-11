@@ -252,6 +252,78 @@ test('modern adapter maps the narrow legacy API without changing HarnessClient',
   });
 });
 
+test('queue and steer omit an unresolved time zone at the in-process gateway boundary', async (t) => {
+  t.mock.method(Intl, 'DateTimeFormat', () => ({ resolvedOptions: () => ({ timeZone: undefined }) }));
+  const events = [];
+  const requests = [];
+  const admitted = Promise.withResolvers();
+  const { ctx } = fakeContext({
+    async invoke({ namespace, method, args }) {
+      assert.equal(namespace, 'session');
+      if (method === 'page') {
+        return { records: events.map(event => ({ type: 'event', event })), hasMore: false };
+      }
+      assert.equal(method, 'prompt');
+      const request = args.request;
+      requests.push(request);
+      assert.equal(Object.hasOwn(request, 'clientTimeZone'), false);
+      if (request.mode === 'queue') {
+        events.push(
+          { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+          { type: 'user/message', seq: 1, time: 1,
+            data: { turn: 1, source: { kind: 'user', rpcId: request.requestId } } },
+        );
+        admitted.resolve();
+      }
+      return { accepted: true };
+    },
+    stream({ namespace, method }) {
+      if (namespace === 'workspace' && method === 'follow') {
+        return asyncValues({ type: 'baseline', value: { items: [], archivedSessionIds: [] } });
+      }
+      assert.equal(`${namespace}/${method}`, 'session/follow');
+      return asyncValues({ type: 'snapshot', cursor: -1, records: [], hasMore: false });
+    },
+  });
+  const client = new HarnessClient({ ...harnessConnection(ctx), workspace: '/workspace' });
+  const control = { owner: {}, key: 'time-zone' };
+  const asking = client.ask('session', 'hello', { control, timeoutMs: 2_000 });
+  try {
+    await Promise.race([admitted.promise, asking]);
+    assert.equal(await client.steerActiveTurn('session', 'continue', control), true);
+    assert.deepEqual(requests.map(request => request.mode), ['queue', 'steer']);
+    assert.ok(requests.every(request => typeof request.requestId === 'string'));
+  } finally {
+    events.push(
+      { type: 'assistant/message', seq: 2, time: 2,
+        data: { turn: 1, message: { content: [{ type: 'text', text: 'done' }] } } },
+      { type: 'turn/end', seq: 3, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+    );
+    assert.equal(await asking, 'done');
+  }
+});
+
+test('modern adapter preserves gateway validation failures through message classification', async () => {
+  const { ctx } = fakeContext({
+    async invoke() {
+      throw Object.assign(new Error('boundary validation failed'), {
+        failure: { code: 'gateway/input-invalid', message: 'boundary validation failed', details: { field: 'request' } },
+      });
+    },
+    stream() { throw new Error('unused'); },
+  });
+  const client = new HarnessClient({ ...harnessConnection(ctx), workspace: '/workspace' });
+  await assert.rejects(client.rpc('session.prompt', { sessionId: 'session' }), error => {
+    assert.ok(error instanceof HarnessRpcError);
+    assert.equal(error.code, 'gateway/input-invalid');
+    assert.equal(error.details.field, 'request');
+    const failure = classifyMessageFailure(error);
+    assert.equal(failure.code, 'HARNESS_PROTOCOL');
+    assert.equal(failure.reason, 'GATEWAY_INPUT_INVALID');
+    return true;
+  });
+});
+
 test('modern adapter preserves Typert business failures as Harness RPC errors', async () => {
   const gateway = {
     async invoke() {

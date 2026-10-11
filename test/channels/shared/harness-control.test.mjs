@@ -649,7 +649,49 @@ test('a refused in-process control action never falls through to HTTP', async ()
   assert.equal(await asking, 'normal completion');
 });
 
-test('steer uses mode steer only while the exact owned turn is still active', async () => {
+for (const [name, value] of [
+  ['Shanghai', 'Asia/Shanghai'],
+  ['UTC', 'UTC'],
+  ['undefined', undefined],
+  ['empty', ''],
+  ['whitespace', '  '],
+  ['null', null],
+  ['non-string', 123],
+  ['constructor throws', new RangeError('unavailable time zone')],
+  ['resolvedOptions throws', new Error('unavailable options')],
+]) {
+  test(`queue and steer tolerate ${name} client time zone`, async (t) => {
+    t.mock.method(Intl, 'DateTimeFormat', () => {
+      if (value instanceof RangeError) throw value;
+      return { resolvedOptions() {
+        if (value instanceof Error) throw value;
+        return { timeZone: value };
+      } };
+    });
+    const turn = controlledTurn();
+    const control = { owner: {}, key: `time-zone:${name}` };
+    const asking = turn.client.ask(turn.id, 'work', { control, timeoutMs: 2_000 });
+    try {
+      await Promise.race([turn.admitted, asking]);
+      assert.equal(await turn.client.steerActiveTurn(turn.id, 'continue', control), true);
+      const prompts = turn.calls.filter(({ method }) => method === 'session.prompt');
+      assert.deepEqual(prompts.map(({ payload }) => payload.mode), ['queue', 'steer']);
+      const expected = typeof value === 'string' && value.trim() ? value : undefined;
+      for (const { payload } of prompts) {
+        assert.equal(Object.hasOwn(payload, 'clientTimeZone'), expected !== undefined);
+        if (expected !== undefined) assert.equal(payload.clientTimeZone, expected);
+      }
+    } finally {
+      turn.finish({ text: 'done', reason: 'completed' });
+      assert.equal(await asking, 'done');
+    }
+  });
+}
+
+test('steer uses mode steer only while the exact owned turn is still active', async (t) => {
+  t.mock.method(Intl, 'DateTimeFormat', () => ({
+    resolvedOptions: () => ({ timeZone: 'Asia/Shanghai' }),
+  }));
   const turn = controlledTurn();
   const control = { owner: {}, key: 'direct:steer' };
   const asking = turn.client.ask(turn.id, 'work', { control, timeoutMs: 2_000 });
@@ -667,7 +709,7 @@ test('steer uses mode steer only while the exact owned turn is still active', as
     sessionId: turn.id,
     mode: 'steer',
     content: [{ type: 'text', text: 'first line\nsecond line' }],
-    clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    clientTimeZone: 'Asia/Shanghai',
   });
   assert.equal(typeof steer.options.rpcId, 'string');
   assert.equal(
