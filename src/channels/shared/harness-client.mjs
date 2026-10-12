@@ -29,9 +29,27 @@ import { watchHarnessMux } from './harness-mux.mjs';
 // from claiming or cancelling each other's interactions.
 const interactionRegistries = new Map();
 const hostInteractionRegistries = new WeakMap();
+const modelCatalogCaches = new WeakMap();
+const MODEL_CATALOG_TTL_MS = 30_000;
 const MAX_ERROR_CLASSIFICATION_BYTES = 64;
 const IM_INPUT_ORIGIN_TTL_MS = 30 * 60 * 1000;
 const MAX_IM_INPUT_ORIGINS = 4096;
+
+function invalidateModelCatalog(entry) {
+  if (!entry) return;
+  entry.value = null;
+  entry.expiresAt = 0;
+  // Old readers may finish, but must not repopulate the cache after a fresh read.
+  entry.pending = null;
+}
+
+export function clearModelCatalogCache(apiProxy) {
+  const entry = modelCatalogCaches.get(apiProxy);
+  if (!entry) return;
+  modelCatalogCaches.delete(apiProxy);
+  invalidateModelCatalog(entry);
+  entry.controller.abort(new DOMException('Harness model catalog disposed', 'AbortError'));
+}
 
 function clientTimeZoneFields() {
   try {
@@ -1187,9 +1205,46 @@ export class HarnessClient {
   }
 
   async listModels(options = {}) {
+    options.signal?.throwIfAborted();
     await this.ensureRunning(options);
-    const value = await this.rpc('llm.models', {}, 30_000, options);
-    return validateModelCatalog(value, 'llm.models');
+    options.signal?.throwIfAborted();
+    if (!this.#apiProxy || options.fresh === true) {
+      try {
+        const value = await this.rpc('llm.models', {}, 30_000, options);
+        return validateModelCatalog(value, 'llm.models');
+      } finally {
+        if (this.#apiProxy) invalidateModelCatalog(modelCatalogCaches.get(this.#apiProxy));
+      }
+    }
+
+    let entry = modelCatalogCaches.get(this.#apiProxy);
+    if (!entry) {
+      entry = { value: null, expiresAt: 0, pending: null, controller: new AbortController() };
+      modelCatalogCaches.set(this.#apiProxy, entry);
+    }
+    if (entry.value && Date.now() < entry.expiresAt) return structuredClone(entry.value);
+    if (!entry.pending) {
+      // The Host owns this read; one caller cancelling must not cancel its peers.
+      const pending = this.rpc('llm.models', {}, 30_000, {
+        ...options, signal: entry.controller.signal,
+      }).then((value) => {
+        const catalog = structuredClone(validateModelCatalog(value, 'llm.models'));
+        if (modelCatalogCaches.get(this.#apiProxy) === entry && entry.pending === pending) {
+          entry.value = catalog;
+          entry.expiresAt = Date.now() + MODEL_CATALOG_TTL_MS;
+        }
+        return catalog;
+      }).finally(() => {
+        if (entry.pending === pending) entry.pending = null;
+      });
+      entry.pending = pending;
+    }
+    const pending = entry.pending;
+    const value = await callWithSignal(
+      () => pending,
+      options.signal ?? entry.controller.signal,
+    );
+    return structuredClone(value);
   }
 
   async getSessionModels(sessionId, options = {}) {

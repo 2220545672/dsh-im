@@ -219,7 +219,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   const proxyEnv = internals.proxyEnv ?? process.env;
   const wsAgent = createFeishuWebSocketAgent(proxyEnv, internals.createProxyAgent);
 
-  const modelCatalog = () => listModelCatalog(harness);
+  const modelCatalog = (options) => listModelCatalog(harness, options);
   const coreController = new Controller({
     logger,
     registerApp: (options) => lark.registerApp(options),

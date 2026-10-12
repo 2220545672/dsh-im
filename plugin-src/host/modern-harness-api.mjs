@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { activeHarnessInteractionOwner, hasActiveHarnessInteractionOwner, harnessToolCallFromEvent, HarnessInteractionError } from '../../src/channels/shared/harness-client.mjs';
+import { activeHarnessInteractionOwner, clearModelCatalogCache, hasActiveHarnessInteractionOwner, harnessToolCallFromEvent, HarnessInteractionError } from '../../src/channels/shared/harness-client.mjs';
 import { extractConnectionEvidence } from '../../src/channels/shared/connection-error.mjs';
 
 const modernApis = new WeakMap();
@@ -857,6 +857,7 @@ class ModernHarnessApi {
   dispose() {
     if (this.#disposed) return;
     this.#disposed = true;
+    clearModelCatalogCache(this);
     for (const subscription of [...this.#mux]) subscription.close();
     this.#assistantStreams.clear();
     for (const pending of [...this.#pendingApprovals.values()]) pending.settle('cancelled');

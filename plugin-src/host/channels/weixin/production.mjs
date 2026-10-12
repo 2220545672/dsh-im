@@ -150,7 +150,7 @@ export async function createProductionController(ctx, config = {}, internals = {
     ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
     imageInputPolicy: () => getImageInputSettingsStore(config).get(),
   });
-  const modelCatalog = () => listModelCatalog(harness);
+  const modelCatalog = (options) => listModelCatalog(harness, options);
   const coreController = new Controller({
     api,
     credentials: ctx.credentials,

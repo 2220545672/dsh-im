@@ -126,7 +126,7 @@ export async function createTokenProductionController(ctx, config, internals, de
     ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
     imageInputPolicy: () => getImageInputSettingsStore(config).get(),
   });
-  const modelCatalog = () => listModelCatalog(harness);
+  const modelCatalog = (options) => listModelCatalog(harness, options);
   // Assigned just below. A transport may need to write a rotated token back
   // through the controller, which is only constructible after createRuntime is
   // defined, so the reference is held in a slot rather than captured directly.

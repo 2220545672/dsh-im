@@ -1469,9 +1469,9 @@ function resolveAgentPresetCatalog(catalog) {
     : normalizeAgentPresetCatalog(value);
 }
 
-function resolveModelCatalog(catalog) {
+function resolveModelCatalog(catalog, options) {
   if (!catalog) return null;
-  const value = typeof catalog === 'function' ? catalog() : catalog;
+  const value = typeof catalog === 'function' ? catalog(options) : catalog;
   return value && typeof value.then === 'function'
     ? value.then(normalizeModelCatalog)
     : normalizeModelCatalog(value);
@@ -2264,7 +2264,7 @@ export function createWorkspaceAwareController(controller, {
         throw error;
       }
       const catalog = model && modelCatalog
-        ? await resolveModelCatalog(modelCatalog)
+        ? await resolveModelCatalog(modelCatalog, { fresh: true })
         : null;
       const entry = modelCatalogEntry(catalog, model);
       if (model && (!modelCatalog || !entry)) {
