@@ -113,6 +113,7 @@ function createFakeApi({ initial = {}, events = {} } = {}) {
     listRelations: async () => ({ events: [] }),
     getRoomStateEvent: async () => null,
     getJoinedMemberCount: async () => 3,
+    getRoomMemberDisplayName: async () => null,
     uploadMedia: async () => 'mxc://media.example.org/up1',
     downloadContent: async () => null,
     drainPendings: () => {
@@ -513,6 +514,44 @@ test('thread membership falls back out of reply context and every conversation i
     deepStrictEqual(contextBlockBodies(context.harness.prompts[3]), [],
       'an event already injected into this conversation is not injected again');
     ok(context.harness.prompts[3].trimEnd().endsWith('第二次真回复祖先'));
+  } finally {
+    await context.stop();
+  }
+});
+
+test('a room-shared conversation labels each turn with its speaker once the profile name is cached', async () => {
+  const context = await createContext();
+  context.fake.getRoomMemberDisplayName = async (roomId, userId) => (
+    roomId === ROOM && userId === '@bob:example.org' ? 'Bob' : null
+  );
+  try {
+    await context.runtime.start();
+    context.fake.pushEvents([groupMessage({
+      sender: '@bob:example.org',
+      body: addressedBody('描述一下这个图片'),
+      content: mentionContent(),
+    })]);
+    await context.waitForPromptCount(1);
+    ok(context.harness.prompts[0].startsWith('bob: 描述一下这个图片'),
+      'the first turn labels with the MXID localpart while the room state read is still in flight');
+
+    context.fake.pushEvents([groupMessage({
+      sender: '@bob:example.org',
+      body: addressedBody('再看一眼颜色'),
+      content: mentionContent(),
+    })]);
+    await context.waitForPromptCount(2);
+    ok(context.harness.prompts[1].startsWith('Bob: 再看一眼颜色'),
+      'later turns ride the cached room profile display name');
+
+    context.fake.pushEvents([groupMessage({
+      sender: '@carol:example.org',
+      body: addressedBody('我这里又有一个问题'),
+      content: mentionContent(),
+    })]);
+    await context.waitForPromptCount(3);
+    ok(context.harness.prompts[2].startsWith('carol: 我这里又有一个问题'),
+      'another member is labelled with its own identity in the shared conversation');
   } finally {
     await context.stop();
   }

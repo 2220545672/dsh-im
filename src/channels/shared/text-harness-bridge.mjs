@@ -56,6 +56,7 @@ import {
   validHarnessQuestion,
 } from './harness-question.mjs';
 import { deliverOutboundArtifacts } from './semantic/artifact-delivery.mjs';
+import { prependSpeakerLabel } from './speaker-label.mjs';
 import {
   hasReplyReference,
   promptContentForInboundMessage,
@@ -840,6 +841,11 @@ export class TextHarnessBridge {
       let content = hasImages || hasReply
         ? await promptContentForInboundMessage(message, { signal: this.#signal, deferImages: true })
         : cleanText(message.content) || undefined;
+      // A room conversation is shared by everyone who addresses the bot in it, so
+      // the delivered prompt says whose turn this is. Only the model-facing content
+      // is labelled; the parsed control text, commands, and ledger keys keep the
+      // unlabelled body they were read from.
+      if (message.kind === 'group') content = prependSpeakerLabel(content, message.speakerName);
       const snapshot = this.#acceptedMessageIds.get(messageId);
       let contextEnhanced = false;
       if (snapshot) {

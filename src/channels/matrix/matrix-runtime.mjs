@@ -319,6 +319,16 @@ export class MatrixRuntime {
   #contextLedger = new Map();
   #ledgerRouteCap = 400;
   #ledgerEntryCap = 512;
+  /**
+   * Group senders' room-state display names. Reads are synchronous against this
+   * cache so the timeline handler never blocks on the homeserver; a miss
+   * schedules the state read and the same sender reads as its MXID localpart
+   * until the name arrives. Entries expire after the TTL and the Map evicts in
+   * insertion order beyond the cap.
+   */
+  #memberNames = new Map();
+  #memberNameCap = 512;
+  #memberNameTtlMs = 600_000;
   #rootOnceEnabled = false;
   #replyContextEnabled = false;
   #ambientContextEnabled = false;
@@ -700,6 +710,14 @@ export class MatrixRuntime {
       return;
     }
     const message = { ...outcome.message };
+    if (message.kind === 'group' && typeof message.senderId === 'string' && message.senderId) {
+      const speakerName = this.#resolveSenderDisplayName(roomId, message.senderId);
+      if (speakerName) {
+        message.speakerName = speakerName;
+        const baseSource = typeof message.contextSource === 'function' ? message.contextSource() : {};
+        message.contextSource = () => ({ ...baseSource, senderName });
+      }
+    }
     if (message.addressed && typeof message.content === 'string' && message.content.startsWith('!')) {
       const resolved = resolveBangMatrixCommand(message.content, (name) => this.#isKnownCommand(name));
       if (resolved !== message.content) {
@@ -1117,6 +1135,33 @@ export class MatrixRuntime {
       return await api.sendEvent(roomId, 'm.room.encrypted', encrypted, options);
     }
     return await api.sendEvent(roomId, eventType, content, options);
+  }
+
+  // Resolves a group sender's display name without blocking the synchronous
+  // timeline handler: a fresh entry answers at once, a stale entry still beats
+  // the localpart while the refresh runs, and a miss labels with the MXID
+  // localpart while the room state read fills the cache for later turns.
+  #resolveSenderDisplayName(roomId, senderId) {
+    const key = `${roomId}|${senderId.toLowerCase()}`;
+    const hit = this.#memberNames.get(key);
+    if (hit && hit.at + this.#memberNameTtlMs > Date.now()) return hit.name;
+    const api = this.#api;
+    if (typeof api?.getRoomMemberDisplayName === 'function') {
+      Promise.resolve(api.getRoomMemberDisplayName(roomId, senderId))
+        .then((name) => {
+          if (!name) return;
+          this.#memberNames.delete(key);
+          this.#memberNames.set(key, { name, at: Date.now() });
+          while (this.#memberNames.size > this.#memberNameCap) {
+            this.#memberNames.delete(this.#memberNames.keys().next().value);
+          }
+        })
+        .catch(() => undefined);
+    }
+    if (hit) return hit.name;
+    const local = senderId.startsWith('@') ? senderId.slice(1) : senderId;
+    const colon = local.indexOf(':');
+    return (colon > 0 ? local.slice(0, colon) : local) || null;
   }
 
   #createMediaSource(content, msgtype) {
