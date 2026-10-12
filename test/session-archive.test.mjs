@@ -205,7 +205,10 @@ test('unknown archive state is an error; confirmed non-archive corruption and fa
       if (failLookup && f.archiveReads > 1) throw new Error('diagnostic failed');
       return { archivedSessionIds: [] };
     };
-    await assert.rejects(f.ask(), (error) => error === original);
+    await assert.rejects(f.ask(), (error) => {
+      assert.deepEqual(error, original);
+      return true;
+    });
   }
 });
 
@@ -214,7 +217,10 @@ test('network, model and attachment failures are not replaced by archive diagnos
     new HarnessRpcError('session.prompt', { code: 'model-unavailable' }),
     new HarnessRpcError('session.prompt', { code: 'attachment-error' })]) {
     const f = fixture(); f.onPrompt = () => { f.archived = true; throw error; };
-    await assert.rejects(f.ask(), (actual) => actual === error);
+    await assert.rejects(f.ask(), (actual) => {
+      assert.deepEqual(actual, error);
+      return true;
+    });
     assert.equal(f.archiveReads, 1);
   }
 });

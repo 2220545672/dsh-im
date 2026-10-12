@@ -5485,7 +5485,7 @@ test('bridge does not expose internal error details in a Feishu failure reply', 
   await bridge.waitForIdle();
 
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /任务未完成，暂时无法确定原因/);
+  assert.match(sent[0], /任务结果尚未确认.*不要立即重复提交/);
   assert.match(sent[0], /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.doesNotMatch(sent[0], /secret-shaped-internal-detail|private\/path/);
   assert.equal(status.lastError, status.lastMessageError.message);
@@ -5493,6 +5493,8 @@ test('bridge does not expose internal error details in a Feishu failure reply', 
   const diagnostic = logs.find(([label]) => label.includes(status.lastMessageError.referenceId))?.[1];
   assert.equal(diagnostic?.code, 'INTERNAL_UNKNOWN');
   assert.equal(diagnostic?.referenceId, status.lastMessageError.referenceId);
+  assert.equal(diagnostic?.details.submissionState, 'unknown');
+  assert.equal(diagnostic?.sessionId, 'session-existing');
   assert.ok(Array.isArray(diagnostic?.errors));
   assert.doesNotMatch(JSON.stringify(logs), /secret-shaped-internal-detail|private\/path/);
 });

@@ -1,5 +1,6 @@
 import { withSessionBindingLock } from './session-binding-lock.mjs';
 import { initialSessionTitle } from './session-title.mjs';
+import { messageDiagnosticError } from './connection-error.mjs';
 
 export const WORKSPACE_SESSION_STALE = 'workspace-session-stale';
 
@@ -114,16 +115,19 @@ export async function askInWorkspaceSession({
     ?? (typeof askOptions === 'object' ? askOptions?.signal : undefined);
   const renameOptions = renameSignal ? { signal: renameSignal } : undefined;
   while (true) {
+    const diagnostic = { stage: 'session.prepare', submissionState: 'not-submitted' };
     try {
       const binding = await withSessionBindingLock(state, key, async () => {
         await awaitPendingConversationSwitch(harness, key);
         let sessionId = state.sessionFor(key);
+        diagnostic.sessionId = sessionId;
         let session = sessionId ? workspaceSession(harness, sessionId, key) : null;
         if (!session || !(await sessionExists(session, existsOptions))) {
           sessionId = await createSession(harness, {
             conversationKey: key,
             ...(createOptions ?? {}),
           });
+          diagnostic.sessionId = sessionId;
           if (await state.setSession(key, sessionId) === false) return null;
           // Binding committed: capture the conversation's effective-workspace
           // generation together with the session, so the prompt below is fenced
@@ -150,6 +154,8 @@ export async function askInWorkspaceSession({
         return { sessionId, session };
       });
       if (!binding) continue;
+      diagnostic.sessionId = binding.sessionId;
+      diagnostic.stage = 'prompt.prepare';
       const artifacts = [];
       const originalOnArtifact = typeof askOptions === 'object'
         && typeof askOptions?.onArtifact === 'function'
@@ -172,6 +178,9 @@ export async function askInWorkspaceSession({
         ? await prepareContent({ sessionId: binding.sessionId, content, text })
         : content ?? text;
       try {
+        // An alternate Harness adapter may not supply finer ask() diagnostics.
+        diagnostic.stage = 'operation';
+        diagnostic.submissionState = 'unknown';
         answer = await binding.session.ask(prompt, artifactOptions);
       } catch (error) {
         if (error?.code === 'harness-reply-timeout' && deferredDelivery) {
@@ -190,7 +199,7 @@ export async function askInWorkspaceSession({
         ...(artifacts.length > 0 ? { artifacts } : {}),
       };
     } catch (error) {
-      if (error?.code !== WORKSPACE_SESSION_STALE) throw error;
+      if (error?.code !== WORKSPACE_SESSION_STALE) throw messageDiagnosticError(error, diagnostic);
     }
   }
 }

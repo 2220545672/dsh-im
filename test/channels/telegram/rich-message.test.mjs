@@ -1008,7 +1008,7 @@ test('Telegram processing failure replaces its placeholder instead of leaving it
       assert.equal(sent[0].text, '正在处理…');
       assert.equal(edits.length, 1);
       assert.equal(edits[0].messageId, 1401);
-      assert.match(edits[0].text, /任务未完成，暂时无法确定原因/);
+      assert.match(edits[0].text, /任务结果尚未确认.*不要立即重复提交/);
       assert.match(edits[0].text, /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}/);
       assert.equal(Object.hasOwn(edits[0], 'richMessage'), false);
     });

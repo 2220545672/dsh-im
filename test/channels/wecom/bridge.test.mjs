@@ -839,7 +839,7 @@ test('Enterprise WeChat finalizes a failed turn without its last progress text',
   const final = transport.streamed.filter(({ finish }) => finish);
   assert.equal(final.length, 1);
   assert.equal(final[0].streamId, 'error-content-stream');
-  assert.match(final[0].content, /^任务未完成/);
+  assert.match(final[0].content, /任务结果尚未确认.*不要立即重复提交/);
   assert.match(final[0].content, /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.doesNotMatch(final[0].content, /<\/?think>|正在整理结果|private provider failure/);
   assert.equal(transport.streamed.at(-1), final[0]);
@@ -1342,7 +1342,7 @@ test('Enterprise WeChat finalizes an existing progress stream when Harness fails
   assert.equal(replies[1].streamId, 'stream-failure');
   assert.equal(replies[1].finish, true);
   assert.doesNotMatch(replies[1].content, /<\/?think>|正在思考中/);
-  assert.match(replies[1].content, /任务未完成，暂时无法确定原因/);
+  assert.match(replies[1].content, /任务结果尚未确认.*不要立即重复提交/);
   assert.match(replies[1].content, /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.equal(store.seen.has('msg-1'), true);
 });

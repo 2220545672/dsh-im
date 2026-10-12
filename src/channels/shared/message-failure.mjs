@@ -1,4 +1,4 @@
-import { connectionHint, extractConnectionEvidence } from './connection-error.mjs';
+import { connectionHint, extractConnectionEvidence, messageDiagnosticError, runtimeDiagnosticDetails } from './connection-error.mjs';
 import { diagnosticFields } from './diagnostic-details.mjs';
 import { randomUUID } from 'node:crypto';
 
@@ -26,6 +26,8 @@ const PROVIDER_FAILURES = Object.freeze({
 });
 
 const FAILURE_MESSAGES = Object.freeze({
+  HARNESS_INTERACTION_TIMEOUT:
+    '与 DSH 的交互通道在 30 秒内未就绪，本条消息尚未提交执行。请稍后重试。',
   HARNESS_CONNECT:
     '无法连接处理服务，消息尚未提交。请确认 DeepSeek Harness 正在运行后重试。',
   HARNESS_TIMEOUT:
@@ -107,18 +109,23 @@ function providerFailureCode(error) {
   return PROVIDER_FAILURES[value.trim().toUpperCase()] ?? null;
 }
 
-function failureCode(error) {
+function failureCode(error, details) {
   const code = typeof error?.code === 'string' ? error.code : '';
   const providerCode = providerFailureCode(error);
   if (providerCode) return providerCode;
+  if (code === 'harness-interaction-timeout') return 'HARNESS_INTERACTION_TIMEOUT';
+
+  const uncertain = details.submissionState === undefined
+    ? ['session.prompt', 'session.history'].includes(error?.method)
+    : details.submissionState !== 'not-submitted';
 
   if (code === 'harness-connect-failed') {
-    return ['session.prompt', 'session.history'].includes(error?.method)
+    return uncertain
       ? 'HARNESS_RESULT_UNCERTAIN'
       : 'HARNESS_CONNECT';
   }
   if (code === 'harness-timeout') {
-    return ['session.prompt', 'session.history'].includes(error?.method)
+    return uncertain
       ? 'HARNESS_RESULT_UNCERTAIN'
       : 'HARNESS_TIMEOUT';
   }
@@ -205,25 +212,38 @@ export function classifyMessageFailure(error, {
   at = Date.now(),
 } = {}) {
   const safeReason = safeFailureReason(reason);
-  const classifiedCode = failureCode(error);
+  const details = extractConnectionEvidence(error).details;
+  const classifiedCode = failureCode(error, details);
   const businessCode = classifiedCode === 'INTERNAL_UNKNOWN'
     && safeReason
     && typeof userMessage === 'string'
     && userMessage.trim()
     ? 'INPUT_INVALID'
     : classifiedCode;
-  const details = extractConnectionEvidence(error).details;
   const code = businessCode === 'INTERNAL_UNKNOWN'
     ? transportFailureCode(error, details)
     : businessCode;
   if (code === 'REQUEST_TIMEOUT' || code === 'NETWORK_ERROR') details.hint = connectionHint(details);
+  if (details.stage || details.submissionState) Object.assign(details, runtimeDiagnosticDetails());
+  let message = FAILURE_MESSAGES[code];
+  if (['INTERNAL_UNKNOWN', 'REQUEST_TIMEOUT', 'NETWORK_ERROR'].includes(code)) {
+    if (details.submissionState === 'not-submitted') {
+      message = code === 'REQUEST_TIMEOUT'
+        ? '消息提交前的操作超时，本条消息尚未提交执行。请稍后重试。'
+        : code === 'NETWORK_ERROR'
+          ? '消息提交前的网络请求失败，本条消息尚未提交执行。请检查连接后重试。'
+          : '消息在提交前处理失败，尚未提交执行。请重试；若持续发生，请将参考号提供给管理员。';
+    } else if (details.submissionState) {
+      message = '消息已尝试提交，但任务结果尚未确认。请先到 DSH 查看状态，不要立即重复提交；若持续发生，请将参考号提供给管理员。';
+    }
+  }
   return Object.freeze({
-    ...(code === 'INTERNAL_UNKNOWN' || details.reason !== 'unknown' || details.httpStatus || details.providerCode || details.method ? { details } : {}),
+    ...(code === 'INTERNAL_UNKNOWN' || details.reason !== 'unknown' || details.httpStatus || details.providerCode || details.method || details.stage || details.submissionState ? { details } : {}),
     code,
     reason: safeReason ?? safeFailureReason(error?.code) ?? code,
     message: typeof userMessage === 'string' && userMessage.trim()
       ? userMessage.trim()
-      : t(FAILURE_MESSAGES[code]) + (code === 'SESSION_ARCHIVED' && error?.promptAccepted === true
+      : t(message) + (code === 'SESSION_ARCHIVED' && error?.promptAccepted === true
         ? `\n${t('本条消息可能仍在会话队列中，请先到 DSH 查看状态，避免重复提交。')}` : ''),
     referenceId: safeReferenceId(referenceId),
     at: Number.isFinite(at) ? at : Date.now(),
@@ -237,7 +257,7 @@ export function messageFailureText(failure) {
 export function messageFailureDiagnostic(error, failure) {
   const evidence = extractConnectionEvidence(error);
   return { code: failure.code, reason: failure.reason, referenceId: failure.referenceId,
-    details: evidence.details, errors: evidence.errors };
+    details: failure.details ?? evidence.details, errors: evidence.errors, ...evidence.correlation };
 }
 
 export function setLastMessageFailure(status, error, options) {
@@ -262,7 +282,7 @@ export function channelDeliveryFailure(error, { uncertain = true } = {}) {
         ? 'channel-delivery-uncertain'
         : 'channel-delivery-failed';
   if (Number.isInteger(status)) wrapped.status = status;
-  return wrapped;
+  return messageDiagnosticError(wrapped, { stage: 'message.send' });
 }
 
 export function publicMessageFailure(value) {

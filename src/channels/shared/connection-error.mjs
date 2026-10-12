@@ -6,7 +6,7 @@ import { t } from './i18n.mjs';
 const reported = new WeakMap();
 const lastReport = new WeakMap();
 const stages = new WeakMap();
-const OWNED_REASONS = { 'connect-timeout': 'timeout', 'telegram-timeout': 'timeout', 'cli-timeout': 'timeout', 'provider-timeout': 'timeout', 'telegram-response-invalid': 'invalid-response', 'office-protocol-mismatch': 'invalid-response' };
+const OWNED_REASONS = { 'harness-interaction-timeout': 'timeout', 'harness-response-invalid': 'invalid-response', 'connect-timeout': 'timeout', 'telegram-timeout': 'timeout', 'cli-timeout': 'timeout', 'provider-timeout': 'timeout', 'telegram-response-invalid': 'invalid-response', 'office-protocol-mismatch': 'invalid-response' };
 const STANDARD_NAMES = new Set(['Error', 'TypeError', 'SyntaxError', 'AggregateError', 'DOMException', 'AxiosError', 'TimeoutError', 'AbortError']);
 const KNOWN_MESSAGES = {
   'discord-401': 'Discord Bot Token 无效，请重新填写。',
@@ -54,18 +54,43 @@ export function extractConnectionEvidence(error) {
   const allReasons = [...new Set(errors.flatMap(e => e.reason === 'multiple-causes' ? e.reasons ?? [] : [e.reason]).filter(r => r && !['unknown', 'multiple-causes'].includes(r)))];
   const precise = allReasons.filter(r => !['timeout', 'http-error', 'provider-rejected', 'invalid-response'].includes(r));
   const reasons = precise.length ? precise : allReasons;
-  const first = field => chain.map(e => normalizeDiagnosticDetails({ [field]: e[field] ?? e.details?.[field] })[field]).find(v => v !== undefined);
+  const first = field => chain.map(e => normalizeDiagnosticDetails({ [field]: stages.get(e)?.[field] ?? e[field] ?? e.details?.[field] })[field]).find(v => v !== undefined);
+  const correlation = {};
+  for (const field of ['sessionId', 'promptRpcId']) {
+    // Only locally attached identifiers belong in logs, never arbitrary RPC details.
+    const value = chain.map(e => stages.get(e)?.[field]).find(v => v !== undefined);
+    if (typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/u.test(value)) correlation[field] = value;
+  }
   return {
-    chain, errors,
+    chain, errors, correlation,
     details: normalizeDiagnosticDetails({
       reason: reasons.length > 1 ? 'multiple-causes' : reasons[0] ?? 'unknown',
       ...(reasons.length > 1 ? { reasons } : {}),
       httpStatus: errors.find(e => e.httpStatus !== undefined)?.httpStatus,
       providerCode: errors.find(e => e.providerCode !== undefined)?.providerCode,
       method: first('method'), transport: first('transport'),
+      stage: first('stage'), submissionState: first('submissionState'),
+      attempts: first('attempts'), lastFailureReason: first('lastFailureReason'),
       durationMs: first('durationMs'), timeoutMs: first('timeoutMs'), host: first('host'), truncated,
     }),
   };
+}
+
+/** Keep request context off shared errors (for example a rejected model-catalog promise).
+ * Preserve the original prototype, properties and cause for existing business handlers. */
+export function messageDiagnosticError(cause, context) {
+  if (cause?.name === 'AbortError') return cause;
+  const source = cause && typeof cause === 'object' ? cause : new Error('Message processing failed');
+  const error = source instanceof DOMException
+    ? Object.defineProperties(new DOMException(source.message, source.name), Object.getOwnPropertyDescriptors(source))
+    : Object.defineProperties(Object.setPrototypeOf(source instanceof Error ? new Error() : {}, Object.getPrototypeOf(source)),
+      Object.getOwnPropertyDescriptors(source));
+  stages.set(error, { ...context, ...stages.get(source) });
+  return error;
+}
+
+export function runtimeDiagnosticDetails() {
+  return { pluginVersion: packageInfo.version, nodeVersion: process.versions.node, platform: process.platform };
 }
 
 export async function atConnectionStage(stage, operation, resource) {
@@ -145,7 +170,7 @@ export function createConnectionDiagnostics({ channel, logger = console, now = D
     const details = normalizeDiagnosticDetails({
       ...evidence.details, ...context, ...safe.details, ...described.details, ...owned,
       channel, stage: owned.stage ?? described.details?.stage ?? safe.details?.stage ?? context.stage ?? operationStage(context.operation),
-      pluginVersion: packageInfo.version, nodeVersion: process.versions.node, platform: process.platform,
+      ...runtimeDiagnosticDetails(),
     });
     const code = safe.code ?? context.code ?? `${channel}-operation-failed`;
     const hint = described.hint ?? safe.hint ?? safe.details?.hint ?? connectionHint(details);
