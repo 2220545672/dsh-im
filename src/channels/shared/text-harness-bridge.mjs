@@ -190,6 +190,7 @@ export class TextHarnessBridge {
   #approvals;
   #batches = new BatchInputManager();
   #interactionCard;
+  #contextHooks = null;
   // Delivery attempts per message id. A failed turn releases its `markSeen` so
   // the next poll can retry, and this counter is what keeps that from becoming
   // an infinite loop on a mail that always fails.
@@ -209,6 +210,7 @@ export class TextHarnessBridge {
     signal,
     keepaliveIntervalMs = 4_000,
     interactionCard = null,
+    contextHooks = null,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -226,6 +228,11 @@ export class TextHarnessBridge {
     this.#signal = signal;
     this.#keepaliveIntervalMs = keepaliveIntervalMs;
     this.#interactionCard = interactionCard ?? null;
+    // Channel-supplied conversation context pipeline (collect/render/consume/deliver).
+    // Channels own what context means and how it is framed; the bridge only runs
+    // the steps at the right points of one turn, so every hook is optional and a
+    // channel without one pays no context work at all.
+    this.#contextHooks = contextHooks && typeof contextHooks === 'object' ? contextHooks : null;
     this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
       deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
     });
@@ -759,6 +766,14 @@ export class TextHarnessBridge {
       }
       if (!hasImages && !hasFiles && command === '/new') {
         await this.#state.clearSession(conversationKey);
+        if (this.#contextHooks?.onSessionCleared) {
+          try {
+            await this.#contextHooks.onSessionCleared(conversationKey);
+          } catch (error) {
+            // The cleared session is already done; a failed context reset must not block the command.
+            this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] failed to reset context anchors after /new:`, error?.message ?? error);
+          }
+        }
         await this.#bot.sendText(target, t('已开启新会话。请发送你的问题。'));
         return;
       }
@@ -840,6 +855,28 @@ export class TextHarnessBridge {
         }));
         contextEnhanced = content !== originalContent;
       }
+      // Collected after command handling so control commands never pay for a
+      // context lookup, and only for a plain-text prompt: a composed or media
+      // payload already carries its own structure and stays untouched.
+      let contextEntries = null;
+      if (this.#contextHooks?.collect && this.#contextHooks.enabled?.() !== false && !batchSubmission
+        && (content === undefined || typeof content === 'string') && !hasImages && !hasFiles) {
+        try {
+          const collected = await this.#contextHooks.collect({
+            message,
+            conversationKey,
+            sessionIdHint: this.#state.sessionFor?.(conversationKey) ?? null,
+          });
+          if (Array.isArray(collected) && collected.length > 0) {
+            contextEntries = collected;
+            const block = this.#contextHooks.render?.(collected) ?? '';
+            if (block) content = `${block}\n\n${content ?? ''}`;
+          }
+        } catch (error) {
+          // Context is an enhancement: a collector failure must not lose the user's own turn.
+          this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] context collection failed; prompting without context:`, error?.message ?? error);
+        }
+      }
       // Start the keepalive only after the inbound payload is ready, so a
       // pre-prompt failure (image parsing, context building) cannot leave the
       // timer running; the outermost finally below clears it on every path.
@@ -863,7 +900,7 @@ export class TextHarnessBridge {
         }, this.#keepaliveIntervalMs);
         keepaliveTimer.unref?.();
       }
-      const { answer, artifacts = [] } = await askInWorkspaceSession({
+      const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
         deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
         state: this.#state,
@@ -926,6 +963,16 @@ export class TextHarnessBridge {
       stopKeepalive();
       if (batchSubmission) {
         this.#batches.complete(conversationKey, batchSubmission.token);
+      }
+      // The completed turn consumed its context: ambient records stop being offered
+      // and a thread-root anchor is stamped for this session. A failed ask throws
+      // past this point, so a failed turn re-offers its context on the next message.
+      if (contextEntries && this.#contextHooks?.onConsumed) {
+        try {
+          await this.#contextHooks.onConsumed({ conversationKey, sessionId, entries: contextEntries });
+        } catch (error) {
+          this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] context consumption marking failed:`, error?.message ?? error);
+        }
       }
       const fileOnlyCompletion = !cleanText(answer) && artifacts.length > 0;
       const visibleAnswer = fileOnlyCompletion
@@ -1010,6 +1057,22 @@ export class TextHarnessBridge {
       }
       // The turn produced an answer, so its retry budget is spent and reset.
       this.#deliveryAttempts.delete(messageId);
+      if (this.#contextHooks?.onDelivered) {
+        const deliveredEventIds = [
+          ...new Set([
+            ...(Array.isArray(textReceipt?.providerMessageIds) ? textReceipt.providerMessageIds : []),
+            ...(Array.isArray(delivery.receipt?.providerMessageIds) ? delivery.receipt.providerMessageIds : []),
+          ]),
+        ];
+        if (deliveredEventIds.length > 0) {
+          try {
+            await this.#contextHooks.onDelivered({ conversationKey, sessionId, providerMessageIds: deliveredEventIds });
+          } catch (error) {
+            // A missing binding only costs reply classification quality for these events; the answer itself reached the room.
+            this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] bot event binding recording failed:`, error?.message ?? error);
+          }
+        }
+      }
       return delivery.receipt;
     } catch (error) {
       stopKeepalive();

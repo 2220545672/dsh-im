@@ -336,6 +336,22 @@ export class MatrixApi {
     });
   }
 
+  /**
+   * Single-event lookup used by the conversation context collectors to resolve a
+   * reply or thread root outside the retained sync window. The homeserver answers
+   * 404 for an unknown event, so a miss travels as null instead of an exception;
+   * an E2EE room returns the still-encrypted event and the caller decrypts it.
+   */
+  async getEvent(roomId, eventId, options = {}) {
+    if (!isMatrixRoomId(roomId) || !isMatrixEventId(eventId)) throw new TypeError('Matrix event lookup target is invalid');
+    return await this.#request('event', {
+      path: `/rooms/${encodeURIComponent(roomId)}/event/${encodeURIComponent(eventId)}`,
+      timeoutMs: 10_000,
+      signal: options.signal,
+    }).catch(() => null);
+  }
+
+
   async listRelations(roomId, eventId, relationType, options = {}) {
     if (!isMatrixRoomId(roomId) || !isMatrixEventId(eventId)) throw new TypeError('Matrix relation query target is invalid');
     if (!/^[m]?[A-Za-z0-9._-]{1,128}$/.test(String(relationType ?? ''))) throw new TypeError('Matrix relation type is invalid');

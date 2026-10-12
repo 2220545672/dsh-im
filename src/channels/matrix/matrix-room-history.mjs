@@ -256,6 +256,26 @@ export class MatrixRoomHistoryStore {
     return matches;
   }
 
+  /**
+   * Mark recorded entries as already offered to a conversation so no later
+   * query re-offers them (the ambient provider's consumption step). Only ids of
+   * live entries count; the count of newly marked ids is returned so callers
+   * can log how much context one turn actually consumed.
+   */
+  markInjected(roomId, eventIds) {
+    const room = this.#value.rooms[roomId];
+    if (!room || !Array.isArray(eventIds)) return 0;
+    const live = new Set(room.entries.map((entry) => entry.eventId));
+    let marked = 0;
+    for (const eventId of eventIds) {
+      if (typeof eventId !== 'string' || room.injected.has(eventId) || !live.has(eventId)) continue;
+      room.injected.add(eventId);
+      marked += 1;
+    }
+    if (marked > 0) this.#persist();
+    return marked;
+  }
+
   /** Drop a room record entirely (used when a room is removed/reset). */
   clear(roomId) {
     if (!this.#value.rooms[roomId]) return false;

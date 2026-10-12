@@ -7,6 +7,8 @@
  */
 
 import { isMatrixEventId, isMatrixRoomId, isMatrixUserId } from './matrix-api.mjs';
+import { buildConversationRoute, encodeConversationRouteKey } from '../shared/conversation/route.mjs';
+import { evaluateTrigger } from '../shared/conversation/trigger-policy.mjs';
 
 const GRACE_MS = 5_000;
 const SKEW_OBSERVE_AFTER_MS = 30_000;
@@ -228,10 +230,27 @@ function threadIdOf(content) {
   return eventId && isMatrixEventId(eventId) ? eventId : null;
 }
 
+function cleanEventId(value) {
+  const eventId = typeof value === 'string' ? value.trim() : '';
+  return eventId && isMatrixEventId(eventId) ? eventId : null;
+}
+
+/**
+ * The target of a genuine reply relation. A falling-back relation is the
+ * thread-membership declaration clients add automatically when sending inside a
+ * thread; per the Matrix spec it is not a human reply, so it must not drive
+ * reply context collection, reply classification or recorded reply targets.
+ */
 function replyEventIdOf(content) {
   const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
-  const eventId = typeof inReplyTo?.event_id === 'string' ? inReplyTo.event_id : null;
-  return eventId && isMatrixEventId(eventId) ? eventId : null;
+  if (!inReplyTo || inReplyTo.is_falling_back === true) return null;
+  return cleanEventId(inReplyTo.event_id);
+}
+
+/** The thread root a falling-back relation names, when the relation falls back. */
+function fallingBackTargetOf(content) {
+  const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
+  return inReplyTo?.is_falling_back === true ? cleanEventId(inReplyTo.event_id) : null;
 }
 
 /**
@@ -278,13 +297,35 @@ export function normalizeMatrixTimelineEvent({
 
   const threadId = threadIdOf(content);
   const replyToEventId = replyEventIdOf(content);
+  // A falling-back relation still names the thread root it belongs to, and that
+  // is the evidence the inherit fork policy uses to keep a reply-opened thread
+  // on the conversation its target belongs to while people continue inside it.
+  const fallingBackThreadTarget = fallingBackTargetOf(content);
   const rawText = typeof content.body === 'string' ? content.body : '';
   const mentioned = detectMatrixMention(content, botUserId);
   const commandLike = isMatrixCommandLike(rawText);
-  const requiresMention = kind === 'group'
-    && config.requireMention !== false
-    && !(config.freeResponseRooms instanceof Set && config.freeResponseRooms.has(roomId));
-  if (requiresMention && !mentioned && !commandLike && replyToEventId === null) return { drop: 'mention-required' };
+  // One table decides the mention gate and the addressed bit, shared with other
+  // channels through the trigger policy. `triggerOnReply` defaults to 'never' —
+  // a room message wakes the bot only through an @-mention or a command, so an
+  // unaddressed reply on the room timeline or in a thread stays a recorded fact.
+  // 'any' restores the 4.25-era shape where every reply relation addresses the
+  // bot; 'bot-only' requires the channel's classifier (usually the bot-event
+  // binding table) to prove the reply answers one of the bot's own messages.
+  const replyTargetKind = kind === 'group' && replyToEventId !== null
+    && typeof deps.classifyReplyTarget === 'function'
+    ? deps.classifyReplyTarget(replyToEventId) ?? null
+    : null;
+  const gate = evaluateTrigger({
+    kind,
+    requireMention: config.requireMention,
+    freeResponse: config.freeResponseRooms instanceof Set && config.freeResponseRooms.has(roomId),
+    mentioned,
+    commandLike,
+    replyToPresent: replyToEventId !== null,
+    replyTargetKind,
+    replyMode: config.triggerOnReply,
+  });
+  if (!gate.pass) return { drop: gate.reason };
 
   const text = stripMatrixMentions(rawText, botUserId);
   const media = MEDIA_MSGTYPES.has(msgtype)
@@ -293,9 +334,35 @@ export function normalizeMatrixTimelineEvent({
   if (MEDIA_MSGTYPES.has(msgtype) && !media) return { drop: 'media-unusable' };
   if (msgtype !== 'm.text' && msgtype !== 'm.notice' && !MEDIA_MSGTYPES.has(msgtype)) return { drop: 'type' };
 
-  const conversationId = kind === 'direct'
-    ? `dm:${senderId.toLowerCase()}`
-    : `room:${roomId}${threadId ? `$${threadId}` : ''}`;
+  // Thread conversation fork policy. A reply whose thread root equals its reply
+  // target only says "answer this message" — the client started a thread at the
+  // replied-to event — so it inherits the conversation its target belongs to
+  // (the room's main conversation) instead of forking a fresh session. A post
+  // made inside an existing thread still forks that thread's conversation.
+  // `isolate` restores fork-always; `auto` prefers the bot-event binding table
+  // when the channel supplies one for the reply target.
+  const threadsMode = config.threadsMode === 'isolate' || config.threadsMode === 'auto'
+    ? config.threadsMode
+    : 'inherit';
+  const inheritsThreadTarget = kind === 'group' && threadId !== null
+    && threadsMode !== 'isolate' && (replyToEventId === threadId || fallingBackThreadTarget === threadId);
+  const routeThreadId = kind === 'group' && threadId !== null && !inheritsThreadTarget ? threadId : null;
+  const boundRouteKey = threadsMode === 'auto' && kind === 'group' && replyToEventId !== null
+    && typeof deps.routeOverrideForReply === 'function'
+    ? deps.routeOverrideForReply(replyToEventId)
+    : null;
+  const routeKey = typeof boundRouteKey === 'string' && boundRouteKey
+    ? boundRouteKey
+    : encodeConversationRouteKey(buildConversationRoute({
+      channel: 'matrix',
+      botId: config.botId ?? null,
+      chatId: roomId,
+      senderId,
+      threadId: routeThreadId,
+      kind,
+    }));
+  const keyPrefix = kind === 'direct' ? 'direct:' : 'group:';
+  const conversationId = routeKey.startsWith(keyPrefix) ? routeKey.slice(keyPrefix.length) : routeKey;
 
   return {
     message: {
@@ -310,7 +377,7 @@ export function normalizeMatrixTimelineEvent({
       plainText: msgtype === 'm.text' && content.format !== 'org.matrix.custom.html',
       images: media?.images ?? [],
       files: media?.files ?? [],
-      addressed: kind === 'direct' || mentioned || commandLike || replyToEventId !== null,
+      addressed: gate.addressed,
       mentioned,
       threadId,
       replyToEventId,
@@ -352,6 +419,17 @@ export function normalizeMatrixDeliveryTarget({ kind, route } = {}) {
 
 export function matrixConversationKeyFromTarget(target) {
   if (!target) return null;
-  if (target.kind === 'dm') return `dm:${target.userId.toLowerCase()}`;
-  return `room:${target.roomId}${'threadId' in target && target.threadId ? `$${target.threadId}` : ''}`;
+  if (target.kind === 'dm') {
+    return encodeConversationRouteKey(buildConversationRoute({
+      channel: 'matrix',
+      chatId: target.userId,
+      senderId: target.userId,
+      kind: 'dm',
+    })).slice('direct:'.length);
+  }
+  return encodeConversationRouteKey(buildConversationRoute({
+    channel: 'matrix',
+    chatId: target.roomId,
+    threadId: 'threadId' in target ? target.threadId : null,
+  })).slice('group:'.length);
 }

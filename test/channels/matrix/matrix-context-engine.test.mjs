@@ -1,0 +1,519 @@
+import test, { after } from 'node:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { deepStrictEqual, ok } from 'node:assert';
+
+import { MatrixRuntime } from '../../../src/channels/matrix/matrix-runtime.mjs';
+import { MatrixSidecarStore } from '../../../src/channels/matrix/matrix-config-store.mjs';
+import { MatrixRoomHistoryStore } from '../../../src/channels/matrix/matrix-room-history.mjs';
+
+const HOME = 'https://matrix.example.org';
+const BOT = '@bot:example.org';
+const ROOM = '!group:example.org';
+const MAIN_KEY = `group:room:${ROOM}`;
+
+/** Read the context block bodies out of one prompt, in arrival order, as the splitter would. */
+function contextBlockBodies(text) {
+  return [...text.matchAll(/<dsh_im_context>([\s\S]*?)<\/dsh_im_context>/g)]
+    .map(([, body]) => JSON.parse(body));
+}
+
+const tempDirectories = new Set();
+let eventSequence = 0;
+
+async function makeTempDirectory(prefix) {
+  const created = await mkdtemp(join(tmpdir(), prefix));
+  tempDirectories.add(created);
+  return created;
+}
+
+after(async () => {
+  for (const directory of tempDirectories) await rm(directory, { recursive: true, force: true });
+});
+
+async function eventually(predicate, label = 'condition', timeoutMs = 4_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let satisfied = false;
+    try {
+      satisfied = Boolean(predicate());
+    } catch {
+      satisfied = false;
+    }
+    if (satisfied) return;
+    if (Date.now() > deadline) throw new Error(`condition was never reached in time: ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function nextEventId() {
+  eventSequence += 1;
+  return `$ctx${eventSequence}:example.org`;
+}
+
+function mentionContent() {
+  return { 'm.mentions': { user_ids: [BOT] } };
+}
+
+function addressedBody(body) {
+  return `${body} <@BOT:Example.ORG>`;
+}
+
+function groupMessage({ sender = '@carol:example.org', body = '问一个问题', ts = Date.now(), content = {} } = {}) {
+  return {
+    type: 'm.room.message',
+    event_id: nextEventId(),
+    sender,
+    origin_server_ts: ts,
+    content: { msgtype: 'm.text', body, ...content },
+  };
+}
+
+function createFakeApi({ initial = {}, events = {} } = {}) {
+  const calls = [];
+  const queue = [];
+  const pendings = [];
+  let batch = 0;
+  let deliveredInitial = false;
+  const fake = {
+    calls,
+    // Deliver the next timeline chunk the way one server event arrives: either the
+    // waiting long-poll takes it immediately, or it waits for the next poll the
+    // sync loop issues.
+    pushEvents(eventsToDeliver, roomId = ROOM) {
+      const chunk = {
+        next_batch: `b${batch += 1}`,
+        rooms: { join: { [roomId]: { timeline: { events: eventsToDeliver } } } },
+      };
+      if (pendings.length > 0) pendings.shift().resolve(structuredClone(chunk));
+      else queue.push(chunk);
+    },
+    whoami: async () => ({ user_id: BOT, device_id: 'DSHDEV' }),
+    sync: async ({ since } = {}) => {
+      calls.push({ op: 'sync', since: since ?? null });
+      if (!deliveredInitial && since === undefined) {
+        deliveredInitial = true;
+        return structuredClone(initial);
+      }
+      if (queue.length > 0) return structuredClone(queue.shift());
+      return await new Promise((resolve, reject) => { pendings.push({ resolve, reject }); });
+    },
+    getAccountData: async () => ({}),
+    setAccountData: async () => ({}),
+    sendEvent: async (roomId, type, content) => {
+      const sentEventId = `$sent${calls.length + 1}:example.org`;
+      calls.push({ op: 'send', roomId, type, content, sentEventId });
+      return { event_id: sentEventId };
+    },
+    setTyping: async () => ({}),
+    sendReceipt: async () => ({}),
+    getEvent: async (roomId, eventId) => events[eventId] ?? null,
+    redactEvent: async () => ({}),
+    listRelations: async () => ({ events: [] }),
+    getRoomStateEvent: async () => null,
+    getJoinedMemberCount: async () => 3,
+    uploadMedia: async () => 'mxc://media.example.org/up1',
+    downloadContent: async () => null,
+    drainPendings: () => {
+      for (const pending of pendings.splice(0)) pending.reject(new Error('test teardown'));
+    },
+  };
+  return fake;
+}
+
+function harnessStub(answer = '好的') {
+  const prompts = [];
+  return {
+    prompts,
+    ensureRunning: async () => true,
+    sessionExists: async () => false,
+    createSession: async () => 'sess-matrix-1',
+    ask: async (...args) => {
+      const prompt = args.find((entry) => typeof entry === 'string' && !entry.startsWith('sess-')) ?? '';
+      prompts.push(prompt);
+      return answer;
+    },
+    stopManagedProcess: () => undefined,
+  };
+}
+
+function stateStub() {
+  const seen = new Set();
+  const sessions = new Map();
+  const anchors = Object.create(null);
+  return {
+    seen,
+    sessions,
+    hasSeen: (id) => seen.has(id),
+    markSeen: async (id) => {
+      seen.add(id);
+    },
+    sessionFor: (key) => sessions.get(key) ?? null,
+    getSession: (key) => sessions.get(key) ?? null,
+    setSession: async (key, id) => {
+      sessions.set(key, id);
+    },
+    clearSession: async (key) => {
+      sessions.delete(key);
+    },
+    // The root anchor table rides the same extension mechanism the production
+    // conversation state store exposes, so the registry under test exercises
+    // its persisted code path rather than the in-process fallback.
+    extensionState: () => ({ rootAnchors: anchors }),
+    persist: async () => undefined,
+    snapshot: () => ({ seenMessageIds: [...seen].slice(-50), sessions: Object.fromEntries(sessions) }),
+  };
+}
+
+function loggerStub() {
+  const notices = [];
+  return {
+    notices,
+    info: () => undefined,
+    debug: () => undefined,
+    warn: (...args) => { notices.push(args.map((entry) => String(entry?.message ?? entry)).join(' ')); },
+    error: (...args) => { notices.push(args.map((entry) => String(entry?.message ?? entry)).join(' ')); },
+  };
+}
+
+async function createContext({ config = {}, initialEvents = [], events = {}, withRoomHistory = false } = {}) {
+  const directory = await makeTempDirectory('dsh-im-matrix-context-');
+  const sidecar = await new MatrixSidecarStore(join(directory, 'matrix.json')).load();
+  const state = stateStub();
+  const logger = loggerStub();
+  const harness = harnessStub();
+  const initial = initialEvents.length > 0
+    ? { next_batch: 'b0', rooms: { join: { [ROOM]: { timeline: { events: initialEvents } } } } }
+    : { next_batch: 'b0' };
+  const fake = createFakeApi({ initial, events });
+  const historyFile = join(directory, 'matrix-history.json');
+  const roomHistory = withRoomHistory ? await new MatrixRoomHistoryStore(historyFile).load() : null;
+  const accessPolicy = {
+    getSettings: () => ({
+      direct: { mode: 'open', open: { defaultCanExecuteCommands: true, commandPermissionOverrides: [] }, allowlist: { users: [] } },
+      group: { mode: 'open', open: { defaultCanExecuteCommands: true, commandPermissionOverrides: [] }, allowlist: { users: [] } },
+    }),
+  };
+  const runtime = new MatrixRuntime({
+    config: {
+      botId: `matrix_${'a'.repeat(24)}`,
+      name: 'Matrix 上下文',
+      homeserver: HOME,
+      userId: BOT,
+      ...config,
+    },
+    accessToken: 'syt_token',
+    harness,
+    state,
+    sidecar,
+    roomHistory,
+    accessPolicy,
+    logger,
+    createApi: () => fake,
+    cryptoStore: null,
+    createCrypto: null,
+    isKnownCommand: () => false,
+  });
+  let stopped = false;
+  const stop = async () => {
+    if (stopped) return;
+    stopped = true;
+    await runtime.stop();
+    fake.drainPendings();
+  };
+  const waitForPromptCount = (count) => eventually(() => harness.prompts.length >= count, `${count} prompts`);
+  return { runtime, fake, state, harness, logger, sidecar, roomHistory, historyFile, stop, waitForPromptCount };
+}
+
+const sentRoomMessages = (fake) => fake.calls.filter((call) => call.op === 'send' && call.type === 'm.room.message');
+
+test('a reply that opens a thread at its target inherits the main conversation while isolate mode still forks', async () => {
+  const repliedTo = nextEventId();
+  const replyOpeningThread = () => groupMessage({
+    body: addressedBody('这个怎么改'),
+    content: {
+      ...mentionContent(),
+      'm.relates_to': {
+        chain: [{ event_id: repliedTo, rel_type: 'm.thread' }],
+        'm.in_reply_to': { event_id: repliedTo },
+      },
+    },
+  });
+  const inherited = await createContext({ initialEvents: [replyOpeningThread()] });
+  try {
+    await inherited.runtime.start();
+    await inherited.waitForPromptCount(1);
+    deepStrictEqual([...inherited.state.sessions.keys()], [MAIN_KEY],
+      'an Element-style reply-threading of a main-feed message continues the main conversation');
+  } finally {
+    await inherited.stop();
+  }
+  const forked = await createContext({ config: { threadsMode: 'isolate' }, initialEvents: [replyOpeningThread()] });
+  try {
+    await forked.runtime.start();
+    await forked.waitForPromptCount(1);
+    ok([...forked.state.sessions.keys()].includes(`${MAIN_KEY}$${repliedTo}`),
+      'the legacy isolate mode keeps a reply-opened thread in its own conversation');
+  } finally {
+    await forked.stop();
+  }
+});
+
+test('a reply trigger rides along its resolved reply chain framed by attribution lines', async () => {
+  const grandparent = '$grand:x.org';
+  const parent = '$parent:x.org';
+  const resolvable = {
+    [parent]: {
+      type: 'm.room.message',
+      event_id: parent,
+      sender: '@dave:example.org',
+      origin_server_ts: 1_712_345_678_000,
+      content: {
+        msgtype: 'm.text',
+        body: '母亲的消息说的是配额',
+        'm.relates_to': { 'm.in_reply_to': { event_id: grandparent } },
+      },
+    },
+    [grandparent]: {
+      type: 'm.room.message',
+      event_id: grandparent,
+      sender: '@erin:example.org',
+      origin_server_ts: 1_712_345_600_000,
+      content: { msgtype: 'm.text', body: '祖先的消息讨论限流' },
+    },
+  };
+  const trigger = groupMessage({
+    body: addressedBody('这到底读的是什么'),
+    content: {
+      ...mentionContent(),
+      'm.relates_to': { 'm.in_reply_to': { event_id: parent } },
+    },
+  });
+  const context = await createContext({ config: { replyContextEnabled: true }, initialEvents: [trigger], events: resolvable });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    const prompt = context.harness.prompts[0];
+    const bodies = contextBlockBodies(prompt);
+    deepStrictEqual(bodies.map((body) => [body.collector, body.event, body.content]), [
+      ['reply', '$grand:x.org', '祖先的消息讨论限流'],
+      ['reply', '$parent:x.org', '母亲的消息说的是配额'],
+    ], 'the resolved chain arrives as two reply-collected blocks, cause before effect');
+    ok(bodies.every((body) => body.room === '!group:example.org'), 'each block names the room it was collected from');
+    ok(prompt.indexOf('祖先的消息讨论限流') < prompt.indexOf('母亲的消息说的是配额'), 'the chain reads cause before effect');
+    ok(prompt.trimEnd().endsWith('这到底读的是什么'), 'the question survives exactly as the human typed it');
+    ok(!prompt.includes('【下面这条才是对你的提问'), 'the structured framing replaces the legacy prose block');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('the same-sender burst ahead of the trigger arrives as attributed ambient context and is consumed once', async () => {
+  const now = Date.now();
+  const context = await createContext({ config: { ambientContextEnabled: true }, withRoomHistory: true });
+  try {
+    await context.runtime.start();
+    // The room record is the ambient source; seed it the way the runtime records unaddressed chatter.
+    context.roomHistory.append({ roomId: ROOM, eventId: '$a1:x.org', sender: '@carol:example.org', name: 'carol', text: '连珠第一条', ts: now - 50_000 });
+    context.roomHistory.append({ roomId: ROOM, eventId: '$a2:x.org', sender: '@carol:example.org', name: 'carol', text: '连珠第二条', ts: now - 30_000 });
+    context.roomHistory.append({ roomId: ROOM, eventId: '$b1:x.org', sender: '@bob:example.org', name: 'bob', text: '路人的旁注', ts: now - 120_000 });
+    context.fake.pushEvents([groupMessage({ body: addressedBody('总结一下'), content: mentionContent() })]);
+    await context.waitForPromptCount(1);
+    const prompt = context.harness.prompts[0];
+    const bodies = contextBlockBodies(prompt);
+    ok(bodies.some((body) => body.collector === 'ambient-burst' && body.content === '连珠第一条')
+      && bodies.some((body) => body.collector === 'ambient-burst' && body.content === '连珠第二条'),
+    'the trailing same-sender run arrives as verbatim burst blocks');
+    ok(bodies.some((body) => body.collector === 'ambient-recent' && body.content === '路人的旁注'),
+    'the rest of the window arrives as a recent block');
+    ok(prompt.indexOf('连珠第一条') < prompt.indexOf('连珠第二条')
+      && prompt.indexOf('连珠第二条') < prompt.indexOf('路人的旁注'), 'ambient context reads older to newer');
+    ok(prompt.trimEnd().endsWith('总结一下'), 'the question survives exactly as the human typed it');
+    ok(!prompt.includes('【下面这条才是对你的提问'), 'the structured framing replaces the legacy prose block');
+    await eventually(
+      () => context.roomHistory.pending({ roomId: ROOM, limit: 50 }).length === 0,
+      'ambient entries are marked consumed after the successful turn',
+    );
+    await context.roomHistory.flush();
+    const reloaded = await new MatrixRoomHistoryStore(context.historyFile).load();
+    deepStrictEqual(reloaded.pending({ roomId: ROOM, limit: 50 }), [],
+      'the consumption markers survive a reload so a restart re-offers nothing');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('the thread root rides along until one successful turn consumes it and /new re-arms it', async () => {
+  const rootId = '$root:x.org';
+  const resolvable = {
+    [rootId]: {
+      type: 'm.room.message',
+      event_id: rootId,
+      sender: '@carol:example.org',
+      origin_server_ts: 1_712_345_000_000,
+      content: { msgtype: 'm.text', body: '话题的根消息' },
+    },
+  };
+  const inThread = (body, { command = false } = {}) => groupMessage({
+    body: command ? body : addressedBody(body),
+    content: command
+      ? { 'm.relates_to': { chain: [{ event_id: rootId, rel_type: 'm.thread' }] } }
+      : { ...mentionContent(), 'm.relates_to': { chain: [{ event_id: rootId, rel_type: 'm.thread' }] } },
+  });
+  const context = await createContext({
+    config: { rootContextOnceEnabled: true },
+    initialEvents: [inThread('第一条讨论')],
+    events: resolvable,
+  });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    ok(contextBlockBodies(context.harness.prompts[0])
+      .some((body) => body.collector === 'thread-root' && body.content === '话题的根消息'),
+    'the first turn of a new thread conversation receives the resolved root');
+    ok([...context.state.sessions.keys()].includes(`${MAIN_KEY}$${rootId}`),
+      'a post made inside an existing thread keeps its own conversation');
+
+    context.fake.pushEvents([inThread('第二条讨论')]);
+    await context.waitForPromptCount(2);
+    ok(!contextBlockBodies(context.harness.prompts[1]).some((body) => body.collector === 'thread-root'),
+      'the consumed root is not re-injected while the same session continues');
+
+    context.fake.pushEvents([inThread('/new', { command: true })]);
+    await eventually(
+      () => sentRoomMessages(context.fake)
+        .some((call) => typeof call.content?.body === 'string' && call.content.body.includes('已开启新会话')),
+      'the /new confirmation',
+    );
+    context.fake.pushEvents([inThread('第三条讨论')]);
+    await context.waitForPromptCount(3);
+    ok(contextBlockBodies(context.harness.prompts[2])
+      .some((body) => body.collector === 'thread-root' && body.content === '话题的根消息'),
+    'after the session was cleared the root context rides along again');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('the shipped room policy wakes the bot only through a mention or a command', async () => {
+  const context = await createContext({
+    initialEvents: [
+      groupMessage({
+        sender: '@carol:example.org',
+        body: '不@直接回复某条人类消息',
+        content: { 'm.relates_to': { 'm.in_reply_to': { event_id: '$human:x.org' } } },
+      }),
+      groupMessage({ sender: '@dave:example.org', body: '主时间线的普通闲聊' }),
+      groupMessage({
+        sender: '@erin:example.org',
+        body: '不@但在线程内的回复',
+        content: { 'm.relates_to': { chain: [{ event_id: '$thread:x.org', rel_type: 'm.thread' }], 'm.in_reply_to': { event_id: '$in-thread:x.org' } } },
+      }),
+    ],
+    withRoomHistory: true,
+  });
+  try {
+    await context.runtime.start();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    deepStrictEqual(context.harness.prompts.length, 0,
+      'unaddressed replies on the timeline or inside a thread stay recorded facts and never wake the bot');
+    context.fake.pushEvents([groupMessage({ body: '这次是 @ 提问', content: mentionContent() })]);
+    await context.waitForPromptCount(1);
+    ok(context.harness.prompts[0].includes('这次是 @ 提问'), 'the @-mention wakes the bot');
+    context.fake.pushEvents([groupMessage({ sender: '@erin:example.org', body: '/notacommand-but-shaped', content: {} })]);
+    await context.waitForPromptCount(2);
+    ok(context.harness.prompts[1].includes('/notacommand-but-shaped'), 'a command-shaped message wakes the bot without a mention');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('bot-only replies answer only replies that provably address the bot and record the rest as ambient facts', async () => {
+  const context = await createContext({
+    config: { triggerOnReply: 'bot-only' },
+    initialEvents: [groupMessage({ sender: '@carol:example.org', body: addressedBody('第一个问题'), content: mentionContent() })],
+    withRoomHistory: true,
+  });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    await eventually(() => sentRoomMessages(context.fake).length > 0, 'the bot answer');
+    const botMessageId = sentRoomMessages(context.fake)[0].sentEventId;
+    context.fake.pushEvents([groupMessage({
+      sender: '@dave:example.org',
+      body: '这个回答很好',
+      content: { 'm.relates_to': { 'm.in_reply_to': { event_id: botMessageId } } },
+    })]);
+    await context.waitForPromptCount(2);
+    ok(context.harness.prompts[1].includes('这个回答很好'), 'a reply to a bound bot message triggers the bot');
+
+    context.fake.pushEvents([groupMessage({
+      sender: '@erin:example.org',
+      body: '回复群里同学的发言',
+      content: { 'm.relates_to': { 'm.in_reply_to': { event_id: '$humanmsg:x.org' } } },
+    })]);
+    await eventually(
+      () => context.roomHistory.pending({ roomId: ROOM, limit: 50 }).some((entry) => entry.text === '回复群里同学的发言'),
+      'the human-directed reply lands in the ambient record',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    deepStrictEqual(context.harness.prompts.length, 2, 'a reply to an unbound target never wakes the bot');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('thread membership falls back out of reply context and every conversation injects an event at most once', async () => {
+  const rootId = nextEventId();
+  const ancientId = nextEventId();
+  const now = Date.now();
+  const events = {
+    [rootId]: { type: 'm.room.message', event_id: rootId, sender: '@carol:example.org', origin_server_ts: now, content: { msgtype: 'm.text', body: 'shijian' } },
+    [ancientId]: { type: 'm.room.message', event_id: ancientId, sender: '@erin:example.org', origin_server_ts: now, content: { msgtype: 'm.text', body: '祖先的消息讨论限流' } },
+  };
+  const threadContinuation = (body) => groupMessage({
+    body: addressedBody(body),
+    content: {
+      ...mentionContent(),
+      'm.relates_to': {
+        chain: [{ event_id: rootId, rel_type: 'm.thread' }],
+        'm.in_reply_to': { event_id: rootId, is_falling_back: true },
+      },
+    },
+  });
+  const realReply = (body, target) => groupMessage({
+    body: addressedBody(body),
+    content: { ...mentionContent(), 'm.relates_to': { 'm.in_reply_to': { event_id: target } } },
+  });
+  const context = await createContext({ config: { rootContextOnceEnabled: true, replyContextEnabled: true }, events });
+  try {
+    await context.runtime.start();
+    context.fake.pushEvents([threadContinuation('第一问话题')]);
+    await context.waitForPromptCount(1);
+    deepStrictEqual(contextBlockBodies(context.harness.prompts[0]).map((body) => [body.collector, body.event, body.content]),
+      [['thread-root', rootId, 'shijian']],
+      'the thread root serves once through the root collector and membership stays out of reply context');
+    ok(context.harness.prompts[0].trimEnd().endsWith('第一问话题'), 'the direct question stays verbatim at the end');
+
+    context.fake.pushEvents([threadContinuation('第二问话题')]);
+    await context.waitForPromptCount(2);
+    deepStrictEqual(contextBlockBodies(context.harness.prompts[1]), [],
+      'later continuations in the thread carry no re-served root and no fake reply context');
+    ok(context.harness.prompts[1].trimEnd().endsWith('第二问话题'));
+
+    context.fake.pushEvents([realReply('第一次真回复祖先', ancientId)]);
+    await context.waitForPromptCount(3);
+    deepStrictEqual(contextBlockBodies(context.harness.prompts[2]).map((body) => [body.collector, body.event, body.content]),
+      [['reply', ancientId, '祖先的消息讨论限流']],
+      'a real reply serves its chain the first time it is seen');
+
+    context.fake.pushEvents([realReply('第二次真回复祖先', ancientId)]);
+    await context.waitForPromptCount(4);
+    deepStrictEqual(contextBlockBodies(context.harness.prompts[3]), [],
+      'an event already injected into this conversation is not injected again');
+    ok(context.harness.prompts[3].trimEnd().endsWith('第二次真回复祖先'));
+  } finally {
+    await context.stop();
+  }
+});

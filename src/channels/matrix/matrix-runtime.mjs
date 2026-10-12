@@ -36,6 +36,11 @@ import {
   extractOutboundMentions,
   hasRoomMention,
 } from './matrix-rich-text.mjs';
+import { RootContextRegistry } from '../shared/conversation/root-context.mjs';
+import { WindowAmbientProvider } from '../shared/conversation/ambient-provider.mjs';
+import { createEventLru, resolveReplyChain } from '../shared/conversation/reply-context.mjs';
+import { renderContextEntries } from '../shared/conversation/context-builder.mjs';
+import { TRIGGER_REPLY_MODES } from '../shared/conversation/trigger-policy.mjs';
 import { chunkMarkdownParts } from '../shared/markdown-chunks.mjs';
 
 const RECONNECT_DELAYS_MS = Object.freeze([1_000, 3_000, 5_000, 10_000, 30_000]);
@@ -45,6 +50,8 @@ const INVITE_JOIN_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_MESSAGE_LENGTH = 16_000;
 const DEFAULT_MAX_MEDIA_BYTES = 104_857_600;
 const EDIT_STREAM_INTERVAL_MS = 350;
+const MATRIX_THREADS_MODES = new Set(['inherit', 'isolate', 'auto']);
+const MAX_BOT_EVENT_BINDINGS = 5_000;
 
 function safeInt(value, min, max, fallback) {
   if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
@@ -270,6 +277,24 @@ export class MatrixRuntime {
     this.#roomContextMaxChars = safeInt(config.roomContextMaxChars, 200, 200_000, 8_000);
     this.#roomContextTzOffsetMinutes = safeInt(config.roomContextTzOffsetMinutes, -840, 840, 0);
     this.#roomContextEnabled = config.roomContextEnabled !== false;
+    this.#threadsMode = MATRIX_THREADS_MODES.has(config.threadsMode) ? config.threadsMode : 'inherit';
+    this.#triggerOnReply = TRIGGER_REPLY_MODES.includes(config.triggerOnReply) ? config.triggerOnReply : 'never';
+    this.#rootOnceEnabled = config.rootContextOnceEnabled === true;
+    this.#replyContextEnabled = config.replyContextEnabled === true;
+    this.#ambientContextEnabled = config.ambientContextEnabled === true;
+    this.#contextMaxChars = safeInt(config.contextMaxChars, 200, 200_000, 8_000);
+    this.#replyMaxDepth = safeInt(config.replyMaxDepth, 1, 10, 5);
+    this.#rootRegistry = new RootContextRegistry({ state });
+    this.#ambientProvider = this.#roomHistory
+      ? new WindowAmbientProvider({
+        store: this.#roomHistory,
+        burstGapMs: safeInt(config.ambientBurstGapMs, 5_000, 3_600_000, 90_000),
+        recentWindowMs: safeInt(config.ambientRecentWindowMs, 10_000, 86_400_000, 180_000),
+        recentCount: safeInt(config.ambientRecentCount, 1, 200, 20),
+        maxContextChars: this.#contextMaxChars,
+      })
+      : null;
+    this.#contextEvents = createEventLru(256);
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#patterns = compileIgnorePatterns(config.ignoreUserPatterns);
     for (const roomId of toRoomSet(config.freeResponseRooms)) this.#freeRooms.add(roomId);
@@ -283,6 +308,26 @@ export class MatrixRuntime {
   #roomContextMaxChars = 8_000;
   #roomContextTzOffsetMinutes = 0;
   #roomContextEnabled = true;
+  #threadsMode = 'inherit';
+  #triggerOnReply = 'never';
+  /**
+   * Within one conversation an event enters the model as collected context at
+   * most once. The ledger is process-local (same lifetime class as the delivered
+   * event bindings): after a restart a first turn may re-present one recent
+   * collected item, which is harmless for the session.
+   */
+  #contextLedger = new Map();
+  #ledgerRouteCap = 400;
+  #ledgerEntryCap = 512;
+  #rootOnceEnabled = false;
+  #replyContextEnabled = false;
+  #ambientContextEnabled = false;
+  #contextMaxChars = 8_000;
+  #replyMaxDepth = 5;
+  #rootRegistry = null;
+  #ambientProvider = null;
+  #contextEvents = null;
+  #botEventBindings = new Map();
 
   get status() {
     return this.#status;
@@ -346,6 +391,12 @@ export class MatrixRuntime {
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
+      // The binding table and the /new anchor reset serve the trigger policy and the
+      // `auto` thread router, not only the context collectors, so those modes wire the
+      // hooks even when every structured-context collector stays off.
+      contextHooks: this.#structuredContextActive() || this.#triggerOnReply === 'bot-only' || this.#threadsMode === 'auto'
+        ? this.#createContextHooks()
+        : null,
     });
     await this.#initialSync();
     if (generation !== this.#generation) return;
@@ -625,18 +676,27 @@ export class MatrixRuntime {
         processNotices: this.#config.processNotices,
         freeResponseRooms: this.#freeRooms,
         allowedRooms: this.#allowedRooms.size > 0 ? this.#allowedRooms : null,
+        threadsMode: this.#threadsMode,
+        triggerOnReply: this.#triggerOnReply,
+        botId: this.#config.botId ?? null,
       },
       patterns: this.#patterns,
       ring: this.#ring,
       clock: this.#clock,
-      deps: { createMediaSource: (mediaContent, msgtype) => this.#createMediaSource(mediaContent, msgtype) },
+      deps: {
+        createMediaSource: (mediaContent, msgtype) => this.#createMediaSource(mediaContent, msgtype),
+        classifyReplyTarget: (eventId) => this.#classifyReplyTarget(eventId),
+        routeOverrideForReply: (eventId) => this.#routeOverrideForReply(eventId),
+      },
     });
     if (outcome.drop) {
       if (outcome.warnSkew && !this.#status.lastClockSkewAt) {
         this.#status.lastClockSkewAt = new Date().toISOString();
         this.#logger.warn?.(t('Matrix 收到的时间戳持续远落后于本机时间，检测到本机时钟超前，请校准系统时间后重启机器人。'));
       }
-      if (outcome.drop === 'mention-required') this.#recordRoomAmbient(roomId, event);
+      if (outcome.drop === 'mention-required'
+        || outcome.drop === 'reply-to-human'
+        || outcome.drop === 'reply-target-unknown') this.#recordRoomAmbient(roomId, event);
       return;
     }
     const message = { ...outcome.message };
@@ -652,7 +712,7 @@ export class MatrixRuntime {
         const commandLike = isMatrixCommandLike(message.content);
         const directAddress = message.mentioned === true || Boolean(message.replyToEventId);
         this.#recordRoomHuman(message, { kind: commandLike ? 'command' : 'human', injected: true });
-        if (!commandLike && directAddress) {
+        if (!commandLike && directAddress && !this.#structuredContextActive()) {
           const block = this.#consumeRoomContext(message.roomId);
           if (block) {
             const label = t('【下面这条才是对你的提问，请只回答它】');
@@ -669,6 +729,223 @@ export class MatrixRuntime {
     if (message.addressed) {
       void this.#api?.setTyping(message.roomId, { typing: true, timeoutMs: 20_000 }).catch(() => undefined);
     }
+  }
+
+  #structuredContextActive() {
+    return this.#rootOnceEnabled === true
+      || this.#replyContextEnabled === true
+      || this.#ambientContextEnabled === true;
+  }
+
+  /** Sync classifier fed to the trigger table: a bound event id proves bot authorship. */
+  #classifyReplyTarget(eventId) {
+    return typeof eventId === 'string' && this.#botEventBindings.has(eventId) ? 'bot' : null;
+  }
+
+  /** The `auto` thread mode's routing hint: the conversation a reply target belongs to. */
+  #routeOverrideForReply(eventId) {
+    if (typeof eventId !== 'string') return null;
+    return this.#botEventBindings.get(eventId)?.conversationKey ?? null;
+  }
+
+  #recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds }) {
+    if (!Array.isArray(providerMessageIds) || providerMessageIds.length === 0) return;
+    for (const eventId of providerMessageIds) {
+      if (typeof eventId !== 'string' || !eventId) continue;
+      this.#botEventBindings.set(eventId, {
+        conversationKey: typeof conversationKey === 'string' && conversationKey ? conversationKey : null,
+        sessionId: typeof sessionId === 'string' && sessionId ? sessionId : null,
+        at: Date.now(),
+      });
+    }
+    while (this.#botEventBindings.size > MAX_BOT_EVENT_BINDINGS) {
+      const oldest = this.#botEventBindings.keys().next().value;
+      this.#botEventBindings.delete(oldest);
+    }
+  }
+
+  /**
+   * Resolve one event for the context collectors through the CS API single-event
+   * endpoint, decrypting when the room is end-to-end encrypted. Resolved lookups
+   * (including misses) are cached per room so a burst of replies into one chain
+   * does not refetch shared ancestors.
+   */
+  async #fetchContextEvent(roomId, eventId) {
+    if (!this.#api || typeof this.#api.getEvent !== 'function') return null;
+    if (typeof eventId !== 'string' || !eventId) return null;
+    const cacheKey = `${roomId}|${eventId}`;
+    const cached = this.#contextEvents.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const event = await this.#api.getEvent(roomId, eventId).catch(() => null);
+    let resolved = null;
+    if (event && typeof event.content === 'object' && event.content !== null) {
+      let content = event.content;
+      if (event.type === 'm.room.encrypted' && this.#crypto) {
+        content = (await this.#crypto.decryptRoomEvent(roomId, event).catch(() => null))?.content ?? null;
+      }
+      const body = typeof content?.body === 'string' ? content.body : '';
+      if (body) {
+        const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
+        // Chain walking follows genuine reply relations only; a falling-back
+        // relation is the thread-membership declaration, not a reply target.
+        const replyTo = inReplyTo?.is_falling_back === true ? null : inReplyTo?.event_id;
+        resolved = {
+          sender: typeof event.sender === 'string' ? event.sender : '',
+          name: '',
+          text: body,
+          ts: Number.isSafeInteger(event.origin_server_ts) && event.origin_server_ts > 0 ? event.origin_server_ts : null,
+          replyTo: typeof replyTo === 'string' && replyTo ? replyTo : null,
+        };
+      }
+    }
+    this.#contextEvents.set(cacheKey, resolved);
+    return resolved;
+  }
+
+  #contextAlreadyInjected(conversationKey, eventId) {
+    if (typeof conversationKey !== 'string' || !conversationKey || typeof eventId !== 'string' || !eventId) return false;
+    return this.#contextLedger.get(conversationKey)?.has(eventId) === true;
+  }
+
+  #markContextInjected(conversationKey, eventIds) {
+    if (typeof conversationKey !== 'string' || !conversationKey || eventIds.length === 0) return;
+    let seen = this.#contextLedger.get(conversationKey);
+    if (seen) {
+      // Recency follows the last injection, so the route cap evicts the stalest conversation.
+      this.#contextLedger.delete(conversationKey);
+      this.#contextLedger.set(conversationKey, seen);
+    } else {
+      seen = new Set();
+      this.#contextLedger.set(conversationKey, seen);
+      while (this.#contextLedger.size > this.#ledgerRouteCap) {
+        const oldest = this.#contextLedger.keys().next().value;
+        if (oldest === conversationKey && this.#contextLedger.size === 1) break;
+        this.#contextLedger.delete(oldest);
+      }
+    }
+    for (const eventId of eventIds) {
+      seen.add(eventId);
+      while (seen.size > this.#ledgerEntryCap) {
+        seen.delete(seen.values().next().value);
+      }
+    }
+  }
+
+  /**
+   * The bridge-facing context pipeline. Collection runs after command handling
+   * so commands never pay for a lookup; consumption markers are applied only when
+   * the turn completed successfully, and delivered event ids feed the binding
+   * table that classifies reply targets and routes `auto` thread replies.
+   */
+  #createContextHooks() {
+    return {
+      enabled: () => this.#structuredContextActive(),
+      collect: async ({ message, conversationKey, sessionIdHint }) => {
+        const entries = [];
+        let used = 0;
+        const offer = (entry) => {
+          const cost = (typeof entry.text === 'string' ? entry.text.length : 0) + 48;
+          if (used + cost > this.#contextMaxChars) return false;
+          used += cost;
+          entries.push(entry);
+          return true;
+        };
+        const roomId = typeof message.roomId === 'string' ? message.roomId : '';
+        if (this.#rootOnceEnabled && message.kind === 'group'
+          && typeof message.threadId === 'string' && message.threadId) {
+          const plan = this.#rootRegistry.plan({
+            routeKey: conversationKey,
+            sessionId: sessionIdHint,
+            rootId: message.threadId,
+          });
+          if (plan.inject && !this.#contextAlreadyInjected(conversationKey, message.threadId)) {
+            const root = await this.#fetchContextEvent(roomId, message.threadId);
+            if (root) {
+              offer({
+                collector: 'thread-root',
+                roomId,
+                eventId: message.threadId,
+                sender: root.sender,
+                name: root.name,
+                ts: root.ts,
+                text: root.text,
+              });
+            }
+          }
+        }
+        if (this.#replyContextEnabled
+          && typeof message.replyToEventId === 'string' && message.replyToEventId) {
+          const chain = await resolveReplyChain({
+            fetch: (eventId) => this.#fetchContextEvent(roomId, eventId),
+            startReplyTo: message.replyToEventId,
+            maxDepth: this.#replyMaxDepth,
+          });
+          for (const node of chain) {
+            if (this.#contextAlreadyInjected(conversationKey, node.eventId)) continue;
+            if (!offer({
+              collector: 'reply',
+              roomId,
+              eventId: node.eventId,
+              sender: node.sender,
+              name: node.name,
+              ts: node.ts,
+              text: node.text,
+            })) break;
+          }
+        }
+        if (this.#ambientContextEnabled && message.kind === 'group' && this.#ambientProvider) {
+          const { burst, recent } = this.#ambientProvider.query({
+            roomId,
+            senderId: typeof message.senderId === 'string' ? message.senderId : '',
+          });
+          for (const record of burst) {
+            if (!offer({
+              collector: 'ambient-burst',
+              roomId,
+              eventId: record.eventId,
+              sender: record.sender,
+              name: record.name,
+              ts: record.ts,
+              text: record.text,
+            })) break;
+          }
+          for (const record of recent) {
+            if (!offer({
+              collector: 'ambient-recent',
+              roomId,
+              eventId: record.eventId,
+              sender: record.sender,
+              name: record.name,
+              ts: record.ts,
+              text: record.text,
+            })) break;
+          }
+        }
+        return entries;
+      },
+      render: (entries) => renderContextEntries(entries),
+      onConsumed: async ({ conversationKey, sessionId, entries }) => {
+        const ambient = entries.filter((entry) => entry.collector === 'ambient-burst' || entry.collector === 'ambient-recent');
+        if (ambient.length > 0 && this.#ambientProvider) {
+          await this.#ambientProvider.markConsumed({ roomId: ambient[0]?.roomId, entries: ambient });
+        }
+        const root = entries.find((entry) => entry.collector === 'thread-root');
+        if (root && typeof sessionId === 'string' && sessionId) {
+          await this.#rootRegistry.markInjected({ routeKey: conversationKey, sessionId, rootId: root.eventId });
+        }
+        const collected = entries.filter((entry) => entry.collector === 'reply' || entry.collector === 'thread-root');
+        if (collected.length > 0) {
+          this.#markContextInjected(conversationKey, collected.map((entry) => entry.eventId).filter(Boolean));
+        }
+      },
+      onSessionCleared: async (conversationKey) => {
+        await this.#rootRegistry.clearRoute(conversationKey);
+        this.#contextLedger.delete(conversationKey);
+      },
+      onDelivered: async ({ conversationKey, sessionId, providerMessageIds }) => {
+        this.#recordBotEventDelivery({ conversationKey, sessionId, providerMessageIds });
+      },
+    };
   }
 
   #recordRoomAmbient(roomId, event) {
