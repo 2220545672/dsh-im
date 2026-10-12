@@ -210,6 +210,19 @@ const STEP_PUSH_POST_CHUNK_MAX_BYTES = 24_000;
 const STEP_STREAM_PATCH_MIN_INTERVAL_MS = 1_000;
 /** Confirm missed boundaries from history; elapsed time is never completion. */
 const MIRROR_CHECK_MS = 30_000;
+/** Retire orphan snapshots outside Feishu's message update window. */
+const MIRROR_STALE_MS = 14 * 24 * 60 * 60_000;
+const MIRROR_RECOVERY_MAX_FAILURES = 20;
+
+function mirrorErrorText(error) {
+  return [error?.response?.data?.msg, error?.msg, error?.message]
+    .filter((value) => typeof value === 'string' && value.trim()).join('; ') || String(error);
+}
+
+function isExpiredMirrorError(error) {
+  return /Message has expired when updating message|Message can only be updated within fourteen days/i
+    .test(mirrorErrorText(error));
+}
 /** One answer chunk inside the streaming card: small enough that the block
  *  splitter can always distribute blocks across sealed/live cards. */
 const STEP_STREAM_ANSWER_CHUNK_MAX_BYTES = 18_000;
@@ -849,27 +862,48 @@ export class FeishuHarnessBridge {
   }
 
   /** Recover only a known finished turn, using its last successful card JSON. */
-  async #sealOrphanMirrors() {
-    for (const [key, entry] of this.#state.mirrorEntries?.() ?? []) {
-      if (!entry?.chatId || !entry.sessionId || !Number.isSafeInteger(entry.turn)
-        || !Array.isArray(entry.cardIds) || !entry.cardIds.length) continue;
-      await this.#queueEventTask(entry.sessionId, async () => {
+  async #sealOrphanMirrors(onlyKey = null) {
+    for (const [key, queuedEntry] of this.#state.mirrorEntries?.() ?? []) {
+      if (onlyKey !== null && key !== onlyKey) continue;
+      if (!queuedEntry?.sessionId) continue;
+      await this.#queueEventTask(queuedEntry.sessionId, async () => {
         if (this.#signal?.aborted) return;
         // An adopted turn now owns this record and will finish through its queue.
         if (this.#sessionSyncTurns.has(key)) return;
+        // A queued timer must not resurrect a deleted record or overwrite a
+        // newer snapshot/failure count with the entry captured before queuing.
+        let entry = this.#state.mirrorEntries?.().find(([entryKey]) => entryKey === key)?.[1];
+        if (!entry?.chatId || !entry.sessionId || !Number.isSafeInteger(entry.turn)
+          || !Array.isArray(entry.cardIds) || !entry.cardIds.length) return;
+        const now = Date.now();
+        if (!Number.isFinite(entry.claimedAt) || entry.claimedAt <= 0 || entry.claimedAt > now) {
+          entry = { ...entry, claimedAt: now };
+          await this.#state.setMirror?.(key, entry);
+        }
+        if (now - entry.claimedAt >= MIRROR_STALE_MS) {
+          await this.#clearMirrorRecovery(key, 'snapshot expired');
+          return;
+        }
+        const failures = Number.isSafeInteger(entry.recoveryFailures) && entry.recoveryFailures > 0
+          ? entry.recoveryFailures : 0;
+        if (failures >= MIRROR_RECOVERY_MAX_FAILURES) {
+          await this.#clearMirrorRecovery(key, 'recovery failure limit reached');
+          return;
+        }
         try {
           const events = await this.#mirrorHistory(entry.sessionId, entry.turn);
+          if (this.#signal?.aborted) return;
           const outcome = extractCompletedTurnAnswer(events, { turn: entry.turn });
           if (outcome.endSeq < 0) {
-            this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors());
+            this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors(key));
             return;
           }
           if (this.#restoreMirrorCard(key, entry)) {
             const result = await this.#finishStepCard(key, {
               answerText: outcome.text, stopped: outcome.reason !== 'completed',
             });
-            if (!result?.ok) throw new Error('Recovered mirror could not deliver its final answer');
-            await this.#state.clearMirror?.(key);
+            if (!result?.ok) throw result?.error ?? new Error('Recovered mirror could not deliver its final answer');
+            await this.#clearMirrorRecovery(key);
             return;
           }
           const content = JSON.parse(entry.lastContent);
@@ -881,12 +915,37 @@ export class FeishuHarnessBridge {
           else elements.push({ tag: 'markdown', content: status });
           // Earlier chunks are sealed history; update only the live card.
           await this.#patchStepCard(entry.cardIds.at(-1), JSON.stringify(content));
-          await this.#state.clearMirror?.(key);
+          await this.#clearMirrorRecovery(key);
         } catch (error) {
-          this.#logger.warn?.('[dsh-feishu] mirror recovery failed:', error?.message ?? error);
-          this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors());
+          if (this.#signal?.aborted) return;
+          const current = this.#state.mirrorEntries?.().find(([entryKey]) => entryKey === key)?.[1];
+          if (!current) return;
+          if (isExpiredMirrorError(error)) {
+            await this.#clearMirrorRecovery(key, 'message expired');
+            return;
+          }
+          await this.#state.setMirror?.(key, { ...current, recoveryFailures: failures + 1 });
+          if (failures + 1 >= MIRROR_RECOVERY_MAX_FAILURES) {
+            await this.#clearMirrorRecovery(key, 'recovery failure limit reached');
+            return;
+          }
+          this.#logger.warn?.('[dsh-feishu] mirror recovery failed:', mirrorErrorText(error),
+            { sessionId: entry.sessionId, turn: entry.turn, recoveryFailures: failures + 1 });
+          this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors(key));
         }
       });
+    }
+  }
+
+  async #clearMirrorRecovery(key, reason = null) {
+    const timerKey = `recovery\0${key}`;
+    clearTimeout(this.#sessionSyncIdleTimers.get(timerKey));
+    this.#sessionSyncIdleTimers.delete(timerKey);
+    const entry = this.#state.mirrorEntries?.().find(([entryKey]) => entryKey === key)?.[1];
+    await this.#state.clearMirror?.(key);
+    if (reason && entry) {
+      this.#logger.warn?.('[dsh-feishu] mirror recovery stopped:', reason,
+        { sessionId: entry.sessionId, turn: entry.turn, recoveryFailures: entry.recoveryFailures ?? 0 });
     }
   }
 
@@ -4231,10 +4290,12 @@ export class FeishuHarnessBridge {
     mirror.result = { ok: result?.ok === true, text };
     mirror.finishedAt = Date.now();
     // Keep the last successful snapshot on failure so recovery can preserve it.
-    if (result?.ok) await this.#state.clearMirror?.(mirror.key);
-    else if (recovering) {
+    if (result?.ok) await this.#clearMirrorRecovery(mirror.key);
+    else if (isExpiredMirrorError(result?.error)) {
+      await this.#clearMirrorRecovery(mirror.key, 'message expired');
+    } else if (recovering) {
       this.#sessionSyncTurns.delete(mirror.key);
-      this.#scheduleMirrorCheck(`recovery\0${mirror.key}`, () => this.#sealOrphanMirrors());
+      this.#scheduleMirrorCheck(`recovery\0${mirror.key}`, () => this.#sealOrphanMirrors(mirror.key));
     }
     return result?.ok === true;
   }
@@ -4924,13 +4985,14 @@ export class FeishuHarnessBridge {
       card.lastRenderAt = this.#stepPushClock.now();
     } catch (error) {
       card.broken = true;
+      card.lastError = error;
       this.#logger.warn?.(
         '[dsh-feishu] step streaming card render failed; the turn continues without it:',
-        error?.message ?? String(error),
+        mirrorErrorText(error),
       );
       if (card.deliveryViaOpenId) {
         this.#logger.warn?.('[dsh-feishu] session-sync mirror card render failed:',
-          error?.message ?? String(error),
+          mirrorErrorText(error),
           { sessionId: card.sessionSyncSessionId, turn: card.sessionSyncTurn });
       }
     }
@@ -4940,9 +5002,8 @@ export class FeishuHarnessBridge {
    * Seal the turn's card with a terminal status and the final answer. The
    * streamed answer draft is rewritten in place with the delivery text; when
    * no draft exists the answer is appended. Returns `{ ok, cardIds }` when
-   * the answer is visible on the cards, or null when the caller must fall
-   * back to the post ladder (absent/broken card, or the answer never reached
-   * a successful render). Safe to call twice.
+   * the answer is visible, `{ ok: false, error }` on failure, or null when
+   * no card exists. Callers fall back unless ok is true. Safe to call twice.
    */
   async #finishStepCard(key, { stopped = false, answerText = null } = {}) {
     const card = this.#stepCards.get(key);
@@ -4951,7 +5012,7 @@ export class FeishuHarnessBridge {
     try {
       await card.renderChain?.catch?.(() => {});
     } catch { /* the seal below decides what the user sees */ }
-    if (card.broken) return null;
+    if (card.broken) return { ok: false, error: card.lastError };
     const status = stopped ? 'stopped' : 'completed';
     const body = typeof answerText === 'string' ? answerText : '';
     // Whether the answer was already visible from a streamed draft render —
@@ -4982,10 +5043,10 @@ export class FeishuHarnessBridge {
       }
       this.#logger.warn?.(
         '[dsh-feishu] step streaming card finish failed:',
-        error?.message ?? String(error),
+        mirrorErrorText(error),
         { sessionId: card.sessionSyncSessionId, turn: card.sessionSyncTurn },
       );
-      return null;
+      return { ok: false, error };
     }
   }
 
@@ -5040,7 +5101,10 @@ export class FeishuHarnessBridge {
       data: { content: cardJson },
     }));
     if (response?.code && response.code !== 0) {
-      throw new Error(`Feishu step card patch failed: ${response.msg || response.code}`);
+      const error = new Error(`Feishu step card patch failed: ${response.msg || response.code}`);
+      error.code = response.code;
+      error.feishuCode = response.code;
+      throw error;
     }
   }
 
