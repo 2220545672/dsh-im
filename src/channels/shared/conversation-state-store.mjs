@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
  * explicit: a subclass reads and writes them through extensionState().
  */
 const EXTENSION_KEYS = Object.freeze([
-  'emailBindings', 'mailCursor', 'pendingAuth', 'threadIds',
+  'emailBindings', 'mailCursor', 'pendingAuth', 'threadIds', 'rootAnchors',
 ]);
 
 const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [], cursor: null });

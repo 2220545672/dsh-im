@@ -34,7 +34,7 @@ import {
   runPresetCommand,
 } from './preset-command.mjs';
 import { askInWorkspaceSession } from './workspace-session.mjs';
-import { HarnessApprovalQueue } from './harness-approval.mjs';
+import { HarnessApprovalQueue, harnessApprovalDecision } from './harness-approval.mjs';
 import {
   BatchInputManager,
   batchInputBusyMessage,
@@ -56,6 +56,7 @@ import {
   validHarnessQuestion,
 } from './harness-question.mjs';
 import { deliverOutboundArtifacts } from './semantic/artifact-delivery.mjs';
+import { prependSpeakerLabel } from './speaker-label.mjs';
 import {
   hasReplyReference,
   promptContentForInboundMessage,
@@ -85,6 +86,8 @@ const FILE_ONLY_COMPLETION_TEXT = '任务已完成。';
  * attempts the mark stays and the message is treated as handled.
  */
 const MAX_DELIVERY_ATTEMPTS = 3;
+/** How many plain-text messages one coalescing window folds into one dispatch. */
+const MAX_COALESCE_MEMBERS = 8;
 
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
@@ -190,10 +193,18 @@ export class TextHarnessBridge {
   #approvals;
   #batches = new BatchInputManager();
   #interactionCard;
+  #contextHooks = null;
   // Delivery attempts per message id. A failed turn releases its `markSeen` so
   // the next poll can retry, and this counter is what keeps that from becoming
   // an infinite loop on a mail that always fails.
   #deliveryAttempts = new Map();
+  // Who opened the in-flight turn per conversation key, for the same-sender
+  // auto-steer lane; and the open coalescing windows awaiting their flush.
+  #turnAuthors = new Map();
+  #coalescing = new Map();
+  #autoSteerSameSender = false;
+  #autoSteerLimit = 0;
+  #coalesceWindowMs = 0;
 
   constructor({
     descriptor,
@@ -209,6 +220,10 @@ export class TextHarnessBridge {
     signal,
     keepaliveIntervalMs = 4_000,
     interactionCard = null,
+    contextHooks = null,
+    autoSteerSameSender = false,
+    autoSteerLimit = 0,
+    coalesceWindowMs = 0,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -226,6 +241,23 @@ export class TextHarnessBridge {
     this.#signal = signal;
     this.#keepaliveIntervalMs = keepaliveIntervalMs;
     this.#interactionCard = interactionCard ?? null;
+    // Opt-in follow-up lanes for channels whose groups run on rapid consecutive
+    // posts: fold a same sender's burst into one dispatch, and steer that
+    // sender's own mid-turn follow-ups into the in-flight turn instead of
+    // queueing them behind the answer they are meant to correct. Off unless a
+    // channel asks for them, so every other channel keeps the plain queue.
+    this.#autoSteerSameSender = autoSteerSameSender === true;
+    this.#autoSteerLimit = Number.isSafeInteger(autoSteerLimit) && autoSteerLimit > 0
+      ? Math.min(autoSteerLimit, 20)
+      : 0;
+    this.#coalesceWindowMs = Number.isSafeInteger(coalesceWindowMs) && coalesceWindowMs > 0
+      ? Math.min(coalesceWindowMs, 3_000)
+      : 0;
+    // Channel-supplied conversation context pipeline (collect/render/consume/deliver).
+    // Channels own what context means and how it is framed; the bridge only runs
+    // the steps at the right points of one turn, so every hook is optional and a
+    // channel without one pays no context work at all.
+    this.#contextHooks = contextHooks && typeof contextHooks === 'object' ? contextHooks : null;
     this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
       deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
     });
@@ -410,6 +442,31 @@ export class TextHarnessBridge {
       this.#commandTasks.add(task);
       return task;
     }
+    // An addressed plain-text request that is no approve/reject token while only
+    // an approval waits is the sender moving on, not a decision: reject the
+    // waiting tool call and run this message as its own turn, so the room is not
+    // held behind a decision that is not coming. A pending question keeps its
+    // ordinary flow — the asking actor's @ text answers it, and other senders
+    // queue behind the turn (questions belong to the asking actor). Direct chats
+    // keep the plain decide-by-token path; their exits are the commands.
+    const addressedTrigger = normalized.kind === 'group' && normalized.addressed === true
+      && normalized.plainText !== false
+      && !hasInboundImages(normalized) && !hasInboundFiles(normalized)
+      && Boolean(text);
+    if (addressedTrigger && !pending
+      && this.#approvals.hasPending(key) && harnessApprovalDecision(text) === null) {
+      let task;
+      task = this.#retireWaitingInteractions(key, pending)
+        .then(() => this.#bot.sendText(normalized.replyTarget, t('已不再等待原有的待回答或待审批，已将其取消，先回应你的新请求。')))
+        .catch(() => undefined)
+        .then(() => this.#dispatchTrigger(normalized, messageId, senderId, key))
+        .finally(() => {
+          this.#acceptedMessageIds.delete(messageId);
+          this.#commandTasks.delete(task);
+        });
+      this.#commandTasks.add(task);
+      return task;
+    }
     const approval = this.#approvals.claimReply({
       key,
       actor: senderId,
@@ -474,33 +531,185 @@ export class TextHarnessBridge {
       pending.queue = current;
       return current;
     }
-    return this.#busyMessages.dispatch({
-      key, messageId, text: normalized.content,
-      commandText: text, mode: busyMessageMode,
-      onFailure: (error) => this.#signal?.aborted || error?.code === 'turn-stopped'
-        ? normalized.statusReaction?.clear() : normalized.statusReaction?.error(),
-      eligible: () => normalized.plainText !== false
-        && !hasInboundImages(normalized) && !hasInboundFiles(normalized)
-        && !hasReplyReference(normalized)
-        && canAutomaticallySteer(this.#accessPolicy, normalized.kind,
-          [senderId, normalized.senderAlternateId].filter(Boolean)),
-      harness: this.#harness, state: this.#state, status: this.#status,
-      signal: this.#signal, control: { owner: this, key }, logger: this.#logger,
-      acceptedMessageIds: this.#acceptedMessageIds,
-      pendingInteraction: () => this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
-      enhancement: {
-        snapshot: this.#acceptedMessageIds.get(messageId),
-        source: () => {
-          const source = normalized.contextSource?.();
-          return { channel: this.#descriptor.key, senderId, senderName: source?.senderName,
-            conversationTitle: source?.conversationTitle,
-            chatId: source?.chatId ?? normalized.conversationId, threadId: source?.threadId };
+    return this.#dispatchTrigger(normalized, messageId, senderId, key, {
+      // Ordinary destinations of the lanes fall through to the busy-mode dispatcher,
+      // keeping its steering, receipts, and routing serialization for what the lanes decline.
+      exit: (exitOptions) => this.#busyMessages.dispatch({
+        key, messageId, text: normalized.content,
+        commandText: text, mode: busyMessageMode,
+        onFailure: (error) => this.#signal?.aborted || error?.code === 'turn-stopped'
+          ? normalized.statusReaction?.clear() : normalized.statusReaction?.error(),
+        eligible: () => normalized.plainText !== false
+          && !hasInboundImages(normalized) && !hasInboundFiles(normalized)
+          && !hasReplyReference(normalized)
+          && canAutomaticallySteer(this.#accessPolicy, normalized.kind,
+            [senderId, normalized.senderAlternateId].filter(Boolean)),
+        harness: this.#harness, state: this.#state, status: this.#status,
+        signal: this.#signal, control: { owner: this, key }, logger: this.#logger,
+        acceptedMessageIds: this.#acceptedMessageIds,
+        pendingInteraction: () => this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
+        enhancement: {
+          snapshot: this.#acceptedMessageIds.get(messageId),
+          source: () => {
+            const source = normalized.contextSource?.();
+            return { channel: this.#descriptor.key, senderId, senderName: source?.senderName,
+              conversationTitle: source?.conversationTitle,
+              chatId: source?.chatId ?? normalized.conversationId, threadId: source?.threadId };
+          },
         },
-      },
-      isQueued: () => this.#queues.has(key),
-      enqueue: (options) => this.#enqueueMessage(normalized, messageId, senderId, key, options),
-      send: (reply) => this.#bot.sendText(normalized.replyTarget, reply),
+        isQueued: () => this.#queues.has(key),
+        enqueue: (enqueueOptions) => this.#enqueueMessage(normalized, messageId, senderId, key, enqueueOptions),
+        send: (reply) => this.#bot.sendText(normalized.replyTarget, reply),
+      }),
     });
+  }
+
+  /**
+   * The ordinary trigger exit, where a message becomes a turn. Three lanes:
+   * while the conversation runs, a plain-text follow-up from the very sender
+   * who opened the in-flight turn steers that turn (the room hears the
+   * correction at the next model step instead of after the whole answer);
+   * on an idle conversation, consecutive plain-text posts from one sender fold
+   * into a single dispatch inside a short window, so a burst split across
+   * bubbles becomes one turn; everything else — other senders, media, composed
+   * payloads — keeps the per-conversation queue that preserves one voice at a
+   * time.
+   * An `exit` hook, when provided, receives every ordinary queue destination of
+   * the lanes, so a channel can fall through to richer routing (busy-mode steering
+   * and queue receipts) for what these lanes decline.
+   */
+  #dispatchTrigger(message, messageId, senderId, key, { exit } = {}) {
+    const toQueue = (options) => (exit
+      ? exit(options)
+      : this.#enqueueMessage(message, messageId, senderId, key, options));
+    const plainText = !hasInboundImages(message) && !hasInboundFiles(message)
+      && message.plainText !== false
+      && Boolean(controlTextOf(message));
+    const author = this.#turnAuthors.get(key);
+    if (author !== undefined && plainText
+      && this.#autoSteerSameSender && this.#autoSteerLimit > 0
+      && author.senderId === senderId && author.steered < this.#autoSteerLimit) {
+      const text = this.#steerTextFor(message, messageId, senderId);
+      const sessionId = this.#state.sessionFor?.(key) ?? null;
+      if (text && sessionId !== null && typeof this.#harness.steerActiveTurn === 'function') {
+        return this.#harness
+          .steerActiveTurn(sessionId, text, { owner: this, key }, this.#signal ? { signal: this.#signal } : undefined)
+          .then((steered) => (steered
+            ? this.#settleSteeredTurn(author, messageId, key)
+            : toQueue()))
+          .catch(() => toQueue());
+      }
+    }
+    if (!this.#queues.has(key) && !this.#pendingInteractions.has(key) && !this.#approvals.hasPending(key)) {
+      const open = this.#coalescing.get(key);
+      if (open !== undefined) {
+        if (open.senderId === senderId && plainText && open.members.length < MAX_COALESCE_MEMBERS) {
+          open.members.push({ message, messageId });
+          return Promise.resolve();
+        }
+        // A different sender, or a payload the window may not fold: this
+        // message dispatches on its own while the window keeps collecting.
+        return toQueue();
+      }
+      if (this.#coalesceWindowMs > 0 && plainText) {
+        const opened = { senderId, members: [{ message, messageId }] };
+        const timer = setTimeout(() => { void this.#flushCoalesced(key); }, this.#coalesceWindowMs);
+        timer.unref?.();
+        this.#coalescing.set(key, opened);
+        return Promise.resolve();
+      }
+    }
+    return toQueue();
+  }
+
+  /**
+   * Tag a turn's own delivery target with its conversation key so the channel can
+   * retire the resulting bubble from that conversation's ambient window: the text
+   * is in the Session transcript already. Local notices, command output, and
+   * interaction prompts send on unstamped targets and stay readable as room facts.
+   */
+  #turnDeliveryTarget(target, conversationKey) {
+    if (!target || typeof target !== 'object'
+      || typeof conversationKey !== 'string' || !conversationKey) return target;
+    return { ...target, dshTurnKey: conversationKey };
+  }
+
+  /** The model-facing body of an auto-steered follow-up, labelled like a turn. */
+  #steerTextFor(message, messageId, senderId) {
+    const body = cleanText(message.content) || controlTextOf(message);
+    if (!body) return null;
+    const labelled = message.kind === 'group' ? prependSpeakerLabel(body, message.speakerName) : body;
+    const snapshot = this.#acceptedMessageIds.get(messageId);
+    if (!snapshot) return labelled;
+    // A mid-turn follow-up carries the same provenance as the message that
+    // opened the turn, so the member who steers is identified to the model too.
+    const contextSource = message.contextSource?.();
+    return enhanceContextContent(labelled, snapshot, () => ({
+      channel: this.#descriptor.key,
+      senderId,
+      senderName: contextSource?.senderName,
+      conversationTitle: contextSource?.conversationTitle,
+      chatId: contextSource?.chatId ?? message.conversationId,
+      threadId: contextSource?.threadId,
+    }));
+  }
+
+  /** A steered message became part of the in-flight turn: settle its receipt. */
+  async #settleSteeredTurn(author, messageId, key) {
+    author.steered += 1;
+    if (!this.#state.hasSeen(messageId)) await this.#state.markSeen(messageId);
+    this.#status.messagesReceived += 1;
+    this.#status.lastMessageAt = new Date().toISOString();
+    this.#acceptedMessageIds.delete(messageId);
+    // The steered body now lives in the in-flight turn, just like a folded
+    // coalescer member: the channel retires its bubble from the ambient window
+    // with the turn instead of re-serving text this session has taken in.
+    if (this.#contextHooks?.onSteered) {
+      void Promise.resolve(this.#contextHooks.onSteered({ conversationKey: key, messageId }))
+        .catch((error) => {
+          this.#logger.warn?.(
+            `[dsh-im:${this.#descriptor.key}] could not retire a steered follow-up from the ambient window:`,
+            error?.message ?? error,
+          );
+        });
+    }
+    return true;
+  }
+
+  /**
+   * Dispatch a folded window as one turn: the merged body carries every
+   * member's text, the answer targets the newest message, and the extra
+   * members travel as `coalescedEventIds` so the channel ledger can retire
+   * them from its ambient window before it re-serves what this turn already
+   * says.
+   */
+  async #flushCoalesced(key) {
+    const open = this.#coalescing.get(key);
+    if (open === undefined) return;
+    this.#coalescing.delete(key);
+    if (this.#signal?.aborted) {
+      for (const member of open.members) this.#acceptedMessageIds.delete(member.messageId);
+      return;
+    }
+    const bodies = [];
+    for (const member of open.members) {
+      const body = cleanText(member.message.content) || controlTextOf(member.message);
+      if (body && !bodies.includes(body)) bodies.push(body);
+      this.#acceptedMessageIds.delete(member.messageId);
+      if (!this.#state.hasSeen(member.messageId)) await this.#state.markSeen(member.messageId);
+      this.#status.messagesReceived += 1;
+    }
+    if (bodies.length === 0) return;
+    this.#status.lastMessageAt = new Date().toISOString();
+    const last = open.members[open.members.length - 1];
+    const merged = {
+      ...last.message,
+      content: bodies.join('\n\n'),
+      ...(open.members.length > 1
+        ? { coalescedEventIds: open.members.slice(0, -1).map((member) => member.messageId) }
+        : {}),
+    };
+    return this.#enqueueMessage(merged, last.messageId, open.senderId, key, { alreadyRecorded: true });
   }
 
   #finishLocalMessage(message, messageId, reply, { recordReceived = true } = {}) {
@@ -572,6 +781,13 @@ export class TextHarnessBridge {
       )),
       ...this.#approvalTasks,
       ...this.#commandTasks,
+      // An unexpired coalescing window drains through its own timer: wait out
+      // its worst-case life so a shutdown never drops folded messages before
+      // the flush enqueues them for the queue wait below to cover.
+      ...this.#coalescing.values().map(() => new Promise((resolve) => {
+        const timer = setTimeout(resolve, this.#coalesceWindowMs + 25);
+        timer.unref?.();
+      })),
     ]);
     await this.#deferred.whenIdle();
   }
@@ -759,6 +975,14 @@ export class TextHarnessBridge {
       }
       if (!hasImages && !hasFiles && command === '/new') {
         await this.#state.clearSession(conversationKey);
+        if (this.#contextHooks?.onSessionCleared) {
+          try {
+            await this.#contextHooks.onSessionCleared(conversationKey);
+          } catch (error) {
+            // The cleared session is already done; a failed context reset must not block the command.
+            this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] failed to reset context anchors after /new:`, error?.message ?? error);
+          }
+        }
         await this.#bot.sendText(target, t('已开启新会话。请发送你的问题。'));
         return;
       }
@@ -782,7 +1006,7 @@ export class TextHarnessBridge {
       let streamFinished = false;
       if (this.#thinkingTraces && typeof this.#bot.openThinkingStream === 'function') {
         try {
-          stream = await this.#bot.openThinkingStream(target);
+          stream = await this.#bot.openThinkingStream(this.#turnDeliveryTarget(target, conversationKey));
           thinkingStream = true;
         } catch (error) {
           stream = null;
@@ -795,7 +1019,7 @@ export class TextHarnessBridge {
       if (!stream) {
         if (typeof this.#bot.openDeliveryStream === 'function') {
           try {
-            stream = await this.#bot.openDeliveryStream(target);
+            stream = await this.#bot.openDeliveryStream(this.#turnDeliveryTarget(target, conversationKey));
             semanticStream = true;
           } catch (error) {
             this.#logger.warn?.(
@@ -805,7 +1029,7 @@ export class TextHarnessBridge {
           }
         } else if (typeof this.#bot.openStream === 'function') {
           try {
-            stream = await this.#bot.openStream(target);
+            stream = await this.#bot.openStream(this.#turnDeliveryTarget(target, conversationKey));
           } catch (error) {
             this.#logger.warn?.(
               `[dsh-im:${this.#descriptor.key}] unable to start a streamed reply; using text:`,
@@ -825,6 +1049,11 @@ export class TextHarnessBridge {
       let content = hasImages || hasReply
         ? await promptContentForInboundMessage(message, { signal: this.#signal, deferImages: true })
         : cleanText(message.content) || undefined;
+      // A room conversation is shared by everyone who addresses the bot in it, so
+      // the delivered prompt says whose turn this is. Only the model-facing content
+      // is labelled; the parsed control text, commands, and ledger keys keep the
+      // unlabelled body they were read from.
+      if (message.kind === 'group') content = prependSpeakerLabel(content, message.speakerName);
       const snapshot = this.#acceptedMessageIds.get(messageId);
       let contextEnhanced = false;
       if (snapshot) {
@@ -839,6 +1068,28 @@ export class TextHarnessBridge {
           threadId: contextSource?.threadId,
         }));
         contextEnhanced = content !== originalContent;
+      }
+      // Collected after command handling so control commands never pay for a
+      // context lookup, and only for a plain-text prompt: a composed or media
+      // payload already carries its own structure and stays untouched.
+      let contextEntries = null;
+      if (this.#contextHooks?.collect && this.#contextHooks.enabled?.() !== false && !batchSubmission
+        && (content === undefined || typeof content === 'string') && !hasImages && !hasFiles) {
+        try {
+          const collected = await this.#contextHooks.collect({
+            message,
+            conversationKey,
+            sessionIdHint: this.#state.sessionFor?.(conversationKey) ?? null,
+          });
+          if (Array.isArray(collected) && collected.length > 0) {
+            contextEntries = collected;
+            const block = this.#contextHooks.render?.(collected) ?? '';
+            if (block) content = `${block}\n\n${content ?? ''}`;
+          }
+        } catch (error) {
+          // Context is an enhancement: a collector failure must not lose the user's own turn.
+          this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] context collection failed; prompting without context:`, error?.message ?? error);
+        }
       }
       // Start the keepalive only after the inbound payload is ready, so a
       // pre-prompt failure (image parsing, context building) cannot leave the
@@ -863,7 +1114,11 @@ export class TextHarnessBridge {
         }, this.#keepaliveIntervalMs);
         keepaliveTimer.unref?.();
       }
-      const { answer, artifacts = [] } = await askInWorkspaceSession({
+      // From here the conversation has a turn in flight that this sender
+      // opened: the auto-steer lane keys its authorship decision off this
+      // record, and the finally below retires it when the turn settles.
+      this.#turnAuthors.set(conversationKey, { senderId, steered: 0, turnMessageId: messageId });
+      const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
         deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
         state: this.#state,
@@ -927,6 +1182,16 @@ export class TextHarnessBridge {
       if (batchSubmission) {
         this.#batches.complete(conversationKey, batchSubmission.token);
       }
+      // The completed turn consumed its context: ambient records stop being offered
+      // and a thread-root anchor is stamped for this session. A failed ask throws
+      // past this point, so a failed turn re-offers its context on the next message.
+      if (contextEntries && this.#contextHooks?.onConsumed) {
+        try {
+          await this.#contextHooks.onConsumed({ conversationKey, sessionId, entries: contextEntries });
+        } catch (error) {
+          this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] context consumption marking failed:`, error?.message ?? error);
+        }
+      }
       const fileOnlyCompletion = !cleanText(answer) && artifacts.length > 0;
       const visibleAnswer = fileOnlyCompletion
         ? t(FILE_ONLY_COMPLETION_TEXT)
@@ -962,12 +1227,13 @@ export class TextHarnessBridge {
       }
       if (!streamFinished) {
         try {
+          const answerTarget = this.#turnDeliveryTarget(target, conversationKey);
           const result = typeof this.#bot.sendDelivery === 'function'
             ? await this.#bot.sendDelivery(
-                target,
+                answerTarget,
                 createTextDeliveryBlock(visibleAnswer, answerFormat),
               )
-            : await this.#bot.sendText(target, visibleAnswer);
+            : await this.#bot.sendText(answerTarget, visibleAnswer);
           textReceipt = createDeliveryReceipt({
             deliveryId: messageId,
             presentation: result?.presentation ?? `${this.#descriptor.key}-text`,
@@ -1010,6 +1276,22 @@ export class TextHarnessBridge {
       }
       // The turn produced an answer, so its retry budget is spent and reset.
       this.#deliveryAttempts.delete(messageId);
+      if (this.#contextHooks?.onDelivered) {
+        const deliveredEventIds = [
+          ...new Set([
+            ...(Array.isArray(textReceipt?.providerMessageIds) ? textReceipt.providerMessageIds : []),
+            ...(Array.isArray(delivery.receipt?.providerMessageIds) ? delivery.receipt.providerMessageIds : []),
+          ]),
+        ];
+        if (deliveredEventIds.length > 0) {
+          try {
+            await this.#contextHooks.onDelivered({ conversationKey, sessionId, providerMessageIds: deliveredEventIds });
+          } catch (error) {
+            // A missing binding only costs reply classification quality for these events; the answer itself reached the room.
+            this.#logger.warn?.(`[dsh-im:${this.#descriptor.key}] bot event binding recording failed:`, error?.message ?? error);
+          }
+        }
+      }
       return delivery.receipt;
     } catch (error) {
       stopKeepalive();
@@ -1088,6 +1370,8 @@ export class TextHarnessBridge {
       return error.deliveryReceipt;
     } finally {
       stopKeepalive();
+      const inFlight = this.#turnAuthors.get(conversationKey);
+      if (inFlight?.turnMessageId === messageId) this.#turnAuthors.delete(conversationKey);
       await Promise.allSettled([
         this.#cancelPendingInteraction(conversationKey),
         this.#approvals.closeRoute(conversationKey),
@@ -1671,5 +1955,37 @@ export class TextHarnessBridge {
         error,
       );
     }
+  }
+
+  /**
+   * Retire what waits on a human decision in this conversation: the pending
+   * question loses its card and gets the same safe cancellation the recovered
+   * path uses, and active tool approvals are rejected. The caller follows it
+   * with the new request's dispatch, so the room hears the answer instead of
+   * the waiting.
+   */
+  async #retireWaitingInteractions(key, pending) {
+    if (pending) {
+      this.#clearPendingInteraction(key, pending.interactionId);
+      pending.claimedReplyMessageId = null;
+      if (pending.cardMessageId) {
+        await this.#retireInteractionCard(pending.target, pending.cardMessageId);
+        pending.cardMessageId = null;
+      }
+      if (pending.kind === 'question') {
+        try {
+          await this.#respondCancellation(
+            pending.interaction,
+            `The ${this.#descriptor.label} sender moved on to a new request before answering.`,
+          );
+        } catch (error) {
+          this.#logger.warn?.(
+            `[dsh-im:${this.#descriptor.key}] failed to cancel an unanswered pending question:`,
+            error?.message ?? error,
+          );
+        }
+      }
+    }
+    await this.#approvals.rejectRoute(key).catch(() => 0);
   }
 }
