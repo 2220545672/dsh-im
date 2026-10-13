@@ -23,6 +23,7 @@ import {
   normalizeMatrixTimelineEvent,
   resolveBangMatrixCommand,
   threadIdOf,
+  replyEventIdOf,
 } from './matrix-normalize.mjs';
 import {
   DEFAULT_ROOM_HISTORY_LIMIT,
@@ -873,16 +874,15 @@ export class MatrixRuntime {
       }
       const body = typeof content?.body === 'string' ? content.body : '';
       if (body) {
-        const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
         // Chain walking follows genuine reply relations only; a falling-back
         // relation is the thread-membership declaration, not a reply target.
-        const replyTo = inReplyTo?.is_falling_back === true ? null : inReplyTo?.event_id;
+        const replyTo = replyEventIdOf(content);
         resolved = {
           sender: typeof event.sender === 'string' ? event.sender : '',
           name: '',
           text: body,
           ts: Number.isSafeInteger(event.origin_server_ts) && event.origin_server_ts > 0 ? event.origin_server_ts : null,
-          replyTo: typeof replyTo === 'string' && replyTo ? replyTo : null,
+          replyTo,
         };
       }
     }
@@ -1469,16 +1469,19 @@ export class MatrixRuntime {
     const providerMessageIds = [];
     for (const chunk of chunks) {
       let content;
+      let sentBody;
       try {
         content = buildMatrixTextContent({
           text: chunk.markdown,
           mentionUserIds: extractOutboundMentions(chunk.markdown),
           roomMention: this.#config.allowRoomMentions && hasRoomMention(chunk.markdown),
         });
+        sentBody = typeof content.body === 'string' && content.body ? content.body : chunk.plain;
       } catch {
         this.#logger.warn?.('[dsh-im:matrix] Rich text could not be prepared; sending plain text');
         if (!chunk.plain) continue;
         content = { msgtype: 'm.text', body: chunk.plain };
+        sentBody = chunk.plain;
       }
       applyMatrixRelations(content, { threadId, replyToEventId });
       const result = await this.#sendRoomEvent(roomId, 'm.room.message', content, {
@@ -1490,7 +1493,7 @@ export class MatrixRuntime {
       // back onto the timeline, so the room-visible store is fed here too and
       // coalesces with any echo a different server does deliver.
       if (options.recordRoom !== false) {
-        this.#recordBotRoomMessage({ roomId, eventId: result?.event_id, text: chunk, threadId, turnKey: this.#targetTurnKey(target) });
+        this.#recordBotRoomMessage({ roomId, eventId: result?.event_id, text: sentBody, threadId, turnKey: this.#targetTurnKey(target) });
       }
     }
     return { providerMessageIds };

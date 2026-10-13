@@ -95,6 +95,32 @@ test('the bot document round-trips through disk and rejects tampered or incomple
   deepStrictEqual(await store.remove(saved.botId), null, 'removing twice is a no-op');
 });
 
+test('the room-visible window and follow-up settings survive the save-and-reread round trip, off values included', async () => {
+  const { store, path } = await freshStore();
+  const settings = {
+    visibleContextEnabled: false,
+    visibleContextWindowMs: 90_000,
+    visibleContextLimit: 3,
+    visibleContextChars: 1_000,
+    coalesceWindowMs: 0,
+    autoSteerSameSender: false,
+    autoSteerLimit: 2,
+  };
+  await store.save(botFixture(settings));
+  for (const [key, value] of Object.entries(settings)) {
+    deepStrictEqual(store.list()[0][key], value, `${key} is kept through the store round trip`);
+  }
+  const reread = new MatrixConfigStore(path);
+  await reread.load();
+  deepStrictEqual(reread.list(), store.list(), 'the on-disk document carries the settings unchanged');
+  await rejects(() => store.save(botFixture({ ...settings, coalesceWindowMs: -1 })),
+    /Refusing to persist incomplete Matrix bot data/u);
+  await rejects(() => store.save(botFixture({ ...settings, visibleContextWindowMs: 'fast' })),
+    /Refusing to persist incomplete Matrix bot data/u);
+  await rejects(() => store.save(botFixture({ ...settings, autoSteerSameSender: 'yes' })),
+    /Refusing to persist incomplete Matrix bot data/u);
+});
+
 test('a corrupt-looking document fails closed on load and an absent file starts empty', async () => {
   const directory = await makeTempDirectory('dsh-im-matrix-store-');
   const path = join(directory, 'matrix-bots.json');

@@ -232,6 +232,42 @@ test('delivery targets round-trip through the conversation-key grammar', () => {
   );
 });
 
+test('genuine reply relations are read from both protocol forms and either fallback marker position demotes them', () => {
+  const legacyReply = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复某条消息',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.in_reply_to': { event_id: '$legacytarget:example.org' },
+  }));
+  deepStrictEqual(legacyReply.message.replyToEventId, '$legacytarget:example.org',
+    'the top-level legacy reply relation carries the reply target');
+  const newFormReply = funnel(event({}, {
+    body: 'hi <@bot:example.org> 回复某条消息',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.relates_to': { event_id: '$newtarget:example.org', rel_type: 'm.reply' },
+  }));
+  deepStrictEqual(newFormReply.message.replyToEventId, '$newtarget:example.org',
+    'the new-form relation with rel_type m.reply carries the reply target');
+  const protocolFallback = funnel(event({}, {
+    body: 'hi <@bot:example.org> 线程内继续发言',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.in_reply_to': { event_id: '$threadC:example.org' },
+    'm.relates_to': { event_id: '$threadC:example.org', rel_type: 'm.thread', is_falling_back: true },
+  }));
+  deepStrictEqual(protocolFallback.message.replyToEventId, null,
+    'the marker under m.relates_to demotes the sibling reply declaration to thread membership');
+  deepStrictEqual(protocolFallback.message.threadId, '$threadC:example.org',
+    'the thread relation still carries the membership through');
+  deepStrictEqual(protocolFallback.message.conversationId, 'room:!roomA:example.org$$threadC:example.org',
+    'a protocol-form fallback post inside a thread forks the thread conversation instead of the mainline');
+  const legacyFallback = funnel(event({}, {
+    body: 'hi <@bot:example.org> 线程内继续发言',
+    'm.mentions': { user_ids: ['@bot:example.org'] },
+    'm.in_reply_to': { event_id: '$threadC:example.org', is_falling_back: true },
+  }));
+  deepStrictEqual(legacyFallback.message.replyToEventId, null,
+    'the marker at the legacy position keeps demoting the reply declaration');
+});
+
 test('a falling-back thread relation is membership and never a reply', () => {
   const continuing = funnel(event({}, {
     body: 'hi <@bot:example.org> 线程内继续发言',

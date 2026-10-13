@@ -21,6 +21,11 @@ const REPLY_DEPTH_BOUNDS = Object.freeze({ min: 1, max: 10 });
 const AMBIENT_GAP_BOUNDS = Object.freeze({ min: 5_000, max: 3_600_000 });
 const AMBIENT_WINDOW_BOUNDS = Object.freeze({ min: 10_000, max: 86_400_000 });
 const AMBIENT_COUNT_BOUNDS = Object.freeze({ min: 1, max: 200 });
+const VISIBLE_CONTEXT_WINDOW_BOUNDS = Object.freeze({ min: 0, max: 86_400_000 });
+const VISIBLE_CONTEXT_LIMIT_BOUNDS = Object.freeze({ min: 0, max: 500 });
+const VISIBLE_CONTEXT_CHARS_BOUNDS = Object.freeze({ min: 200, max: 200_000 });
+const COALESCE_WINDOW_BOUNDS = Object.freeze({ min: 0, max: 60_000 });
+const AUTO_STEER_LIMIT_BOUNDS = Object.freeze({ min: 0, max: 100 });
 const THREADS_MODES = Object.freeze(['inherit', 'isolate', 'auto']);
 const TRIGGER_ON_REPLY_MODES = Object.freeze(['any', 'bot-only', 'never']);
 
@@ -199,6 +204,11 @@ export class MatrixConfigStore {
     const ambientBurstGapMs = boundedInteger(value.ambientBurstGapMs, AMBIENT_GAP_BOUNDS);
     const ambientRecentWindowMs = boundedInteger(value.ambientRecentWindowMs, AMBIENT_WINDOW_BOUNDS);
     const ambientRecentCount = boundedInteger(value.ambientRecentCount, AMBIENT_COUNT_BOUNDS);
+    const visibleContextWindowMs = boundedInteger(value.visibleContextWindowMs, VISIBLE_CONTEXT_WINDOW_BOUNDS);
+    const visibleContextLimit = boundedInteger(value.visibleContextLimit, VISIBLE_CONTEXT_LIMIT_BOUNDS);
+    const visibleContextChars = boundedInteger(value.visibleContextChars, VISIBLE_CONTEXT_CHARS_BOUNDS);
+    const coalesceWindowMs = boundedInteger(value.coalesceWindowMs, COALESCE_WINDOW_BOUNDS);
+    const autoSteerLimit = boundedInteger(value.autoSteerLimit, AUTO_STEER_LIMIT_BOUNDS);
     if (!E2EE_MODES.has(e2eeMode) || !AUTO_JOIN_MODES.has(autoJoinInvites)
       || maxMessageLength === null || maxMediaBytes === null
       || allowedRooms === null || freeResponseRooms === null || ignoreUserPatterns === null
@@ -206,9 +216,12 @@ export class MatrixConfigStore {
       || roomContextTzOffsetMinutes === null
       || !THREADS_MODES.includes(threadsMode) || !TRIGGER_ON_REPLY_MODES.includes(triggerOnReply)
       || contextMaxChars === null || replyMaxDepth === null
-      || ambientBurstGapMs === null || ambientRecentWindowMs === null || ambientRecentCount === null) return null;
+      || ambientBurstGapMs === null || ambientRecentWindowMs === null || ambientRecentCount === null
+      || visibleContextWindowMs === null || visibleContextLimit === null || visibleContextChars === null
+      || coalesceWindowMs === null || autoSteerLimit === null) return null;
     for (const key of ['requireMention', 'processNotices', 'allowRoomMentions', 'reactions', 'roomContextEnabled',
-      'rootContextOnceEnabled', 'replyContextEnabled', 'ambientContextEnabled']) {
+      'rootContextOnceEnabled', 'replyContextEnabled', 'ambientContextEnabled',
+      'visibleContextEnabled', 'autoSteerSameSender']) {
       if (value?.[key] !== undefined && typeof value[key] !== 'boolean') return null;
     }
     return Object.freeze({
@@ -248,6 +261,13 @@ export class MatrixConfigStore {
       ...(ambientBurstGapMs !== undefined ? { ambientBurstGapMs } : {}),
       ...(ambientRecentWindowMs !== undefined ? { ambientRecentWindowMs } : {}),
       ...(ambientRecentCount !== undefined ? { ambientRecentCount } : {}),
+      ...(typeof value.visibleContextEnabled === 'boolean' ? { visibleContextEnabled: value.visibleContextEnabled } : {}),
+      ...(visibleContextWindowMs !== undefined ? { visibleContextWindowMs } : {}),
+      ...(visibleContextLimit !== undefined ? { visibleContextLimit } : {}),
+      ...(visibleContextChars !== undefined ? { visibleContextChars } : {}),
+      ...(coalesceWindowMs !== undefined ? { coalesceWindowMs } : {}),
+      ...(typeof value.autoSteerSameSender === 'boolean' ? { autoSteerSameSender: value.autoSteerSameSender } : {}),
+      ...(autoSteerLimit !== undefined ? { autoSteerLimit } : {}),
     });
   }
 

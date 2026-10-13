@@ -237,16 +237,31 @@ function cleanEventId(value) {
 }
 
 /**
- * The target of a genuine reply relation. A falling-back relation is the
- * thread-membership declaration clients add automatically when sending inside a
- * thread; per the Matrix spec it is not a human reply, so it must not drive
- * reply context collection, reply classification, recorded reply targets, or
- * the thread fork decision.
+ * The target of a genuine reply relation, in either relation form the Matrix
+ * spec permits: the new form names it under `m.relates_to` with
+ * `rel_type: "m.reply"`, the legacy form under the top-level `m.in_reply_to`,
+ * and this plugin's own writer nests it under `m.relates_to` for the events it
+ * sends itself. The `is_falling_back` marker — at `m.relates_to`, at the
+ * legacy `m.in_reply_to`, or on the nested form — demotes the declaration to
+ * the thread-membership statement clients attach automatically when sending
+ * inside a thread; per the spec that is not a human reply, so it must not
+ * drive reply context collection, reply classification, recorded reply targets,
+ * or the thread fork decision.
  */
-function replyEventIdOf(content) {
-  const inReplyTo = content?.['m.relates_to']?.['m.in_reply_to'];
-  if (!inReplyTo || inReplyTo.is_falling_back === true) return null;
-  return cleanEventId(inReplyTo.event_id);
+export function replyEventIdOf(content) {
+  const relates = content?.['m.relates_to'];
+  const legacy = content?.['m.in_reply_to'];
+  const nested = relates?.['m.in_reply_to'];
+  if (relates?.is_falling_back === true || legacy?.is_falling_back === true || nested?.is_falling_back === true) return null;
+  if (relates?.rel_type === 'm.reply') {
+    const target = cleanEventId(relates.event_id);
+    if (target) return target;
+  }
+  for (const candidate of [legacy?.event_id, nested?.event_id]) {
+    const target = cleanEventId(candidate);
+    if (target) return target;
+  }
+  return null;
 }
 
 /**

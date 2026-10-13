@@ -483,15 +483,16 @@ test('thread membership falls back out of reply context and every conversation i
     body: addressedBody(body),
     content: {
       ...mentionContent(),
+      'm.in_reply_to': { event_id: rootId },
       'm.relates_to': {
         chain: [{ event_id: rootId, rel_type: 'm.thread' }],
-        'm.in_reply_to': { event_id: rootId, is_falling_back: true },
+        is_falling_back: true,
       },
     },
   });
   const realReply = (body, target) => groupMessage({
     body: addressedBody(body),
-    content: { ...mentionContent(), 'm.relates_to': { 'm.in_reply_to': { event_id: target } } },
+    content: { ...mentionContent(), 'm.in_reply_to': { event_id: target } },
   });
   const context = await createContext({ config: { rootContextOnceEnabled: true, replyContextEnabled: true }, events });
   try {
@@ -708,9 +709,10 @@ test('another conversation keeps reading a bot answer that its own conversation 
       body: addressedBody('在这条回答下开线追问'),
       content: {
         ...mentionContent(),
+        'm.in_reply_to': { event_id: answerEventId },
         'm.relates_to': {
           chain: [{ event_id: answerEventId, rel_type: 'm.thread' }],
-          'm.in_reply_to': { event_id: answerEventId, is_falling_back: true },
+          is_falling_back: true,
         },
       },
     })]);
@@ -719,6 +721,33 @@ test('another conversation keeps reading a bot answer that its own conversation 
       'a member opening the panel under the bot answer still reads that bubble: the retirement is scoped to the producing conversation');
     ok(!context.harness.prompts[1].includes('主线提问'),
       'the mainline question behind the panel stays out of the thread window, provenance-stamped or not');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('folded same-sender triggers never resurface as room-visible context entries', async () => {
+  const first = groupMessage({ sender: '@alice:example.org', body: addressedBody('第一问先落地'), content: mentionContent() });
+  const second = groupMessage({ sender: '@alice:example.org', body: addressedBody('第二问随后到'), content: mentionContent() });
+  const context = await createContext({
+    withRoomHistory: true,
+    answer: '两问合答的一条回答',
+    initialEvents: [first, second],
+    config: { coalesceWindowMs: 250 },
+  });
+  try {
+    await context.runtime.start();
+    await context.waitForPromptCount(1);
+    const prompt = context.harness.prompts[0];
+    ok(prompt.includes('第一问先落地') && prompt.includes('第二问随后到'),
+      'both folded questions reach the turn once, as the dispatch body');
+    deepStrictEqual(
+      contextBlockBodies(prompt)
+        .filter((entry) => entry.event === first.event_id || entry.event === second.event_id)
+        .map((entry) => entry.event),
+      [],
+      'no folded member reappears inside the injected context blocks',
+    );
   } finally {
     await context.stop();
   }

@@ -706,7 +706,7 @@ export class TextHarnessBridge {
       ...last.message,
       content: bodies.join('\n\n'),
       ...(open.members.length > 1
-        ? { coalescedEventIds: open.members.slice(1).map((member) => member.messageId) }
+        ? { coalescedEventIds: open.members.slice(0, -1).map((member) => member.messageId) }
         : {}),
     };
     return this.#enqueueMessage(merged, last.messageId, open.senderId, key, { alreadyRecorded: true });
