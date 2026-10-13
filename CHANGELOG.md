@@ -6,6 +6,27 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [4.38.2] - 2026-10-13
+
+### Fixed / 修复
+
+- 飞书双向同步不再无限重试已过期的镜像卡片：识别平台的过期拒绝，清理超过 14 天的恢复快照，并为恢复失败设置可跨重启保留的 20 次上限。每条记录独立调度，执行前重新读取状态，避免旧定时任务恢复已删除记录或覆盖较新的快照；现有卡片与纯文本兜底保持不变。（[#352](https://github.com/xmanrui/dsh-im/issues/352)）
+  Feishu bidirectional sync stops endlessly retrying expired mirror cards. It recognizes provider expiry rejections, retires recovery snapshots older than 14 days, and persists a 20-failure recovery limit across restarts. Each record retries independently and rereads current state before running, preventing stale timers from resurrecting deleted records or overwriting newer snapshots. Existing card and plain-text fallbacks remain unchanged. ([#352](https://github.com/xmanrui/dsh-im/issues/352))
+- Harness 消息失败明确区分准备会话、准备消息、建立交互通道、提交消息和等待结果等阶段，并标明「未提交／已确认接收／提交结果未知」。交互通道 30 秒未就绪时明确提示消息尚未提交；已尝试提交但结果不确定时提示先到 DSH 查看，避免立即重复发送。
+  Harness message failures distinguish session preparation, prompt preparation, interaction setup, submission, and result waiting, with explicit not-submitted, accepted, or unknown submission states. A 30-second interaction-setup timeout clearly reports that no prompt was submitted; uncertain post-submission failures advise checking DSH before resending.
+- 管理页面、中英文提示、复制诊断和日志补齐失败阶段、提交状态、连接尝试次数、最近连接失败原因及运行环境信息。诊断字段使用白名单，关联标识仅进入本地日志；为每次请求保留独立上下文，不污染共享错误，也不改变取消与既有重试行为。
+  Management UI, bilingual messages, copied diagnostics, and logs now include failure stage, submission state, connection-attempt count, last connection failure, and runtime information. Fields are allowlisted, correlation identifiers stay in local logs, and request-specific context does not mutate shared errors or alter cancellation and existing retry behavior.
+
+### Performance / 性能优化
+
+- 同一 Host 的本地 IM 客户端共享经过校验的模型目录缓存（30 秒），合并并发读取并为调用者返回独立副本；单个调用取消不影响其他调用。保存模型设置时强制重新校验目录，Host 释放时清理缓存；远程 HTTP 客户端不共享此缓存。（[#349](https://github.com/xmanrui/dsh-im/issues/349)）
+  Local IM clients on the same Host share a validated model catalog for 30 seconds, coalesce concurrent reads, and receive independent copies. Cancelling one reader does not cancel peers. Saving model settings forces fresh validation, Host disposal clears the cache, and remote HTTP clients do not share it. ([#349](https://github.com/xmanrui/dsh-im/issues/349))
+
+### Notes / 使用说明
+
+- 依赖声明与 DSH `0.2.0-rc.2` 兼容声明保持不变；升级后重启 Host 并刷新管理页面，以加载同版 Host 和客户端诊断逻辑。
+  Dependency declarations and declared DSH `0.2.0-rc.2` compatibility remain unchanged. Restart the Host and refresh the management page after upgrading so Host and client diagnostics use the same version.
+
 ## [4.38.1] - 2026-10-12
 
 ### Fixed / 修复
@@ -1695,7 +1716,8 @@ This file records the notable changes in each dsh-im release. Its format follows
 - 改进 npm 发布包结构，保留 CLI 入口并避免安装脚本拦截。
   Improved npm package contents to preserve the CLI entry point and avoid install-script blocking.
 
-[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.38.1...HEAD
+[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.38.2...HEAD
+[4.38.2]: https://github.com/xmanrui/dsh-im/compare/v4.38.1...v4.38.2
 [4.38.1]: https://github.com/xmanrui/dsh-im/compare/v4.38.0...v4.38.1
 [4.38.0]: https://github.com/xmanrui/dsh-im/compare/v4.37.0...v4.38.0
 [4.37.0]: https://github.com/xmanrui/dsh-im/compare/v4.36.1...v4.37.0
