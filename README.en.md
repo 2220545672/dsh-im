@@ -30,6 +30,12 @@
     <img src="https://img.shields.io/badge/iMessage-34C759?logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI%2BPHBhdGggZmlsbD0iI2ZmZiIgZD0iTTEyIDNDNS45MjUgMyAxIDcuMDI5IDEgMTJjMCAyLjc1MSAxLjUxNCA1LjIxNCAzLjkwMSA2Ljg2NS4yOTEgMS41MjYtLjE3NCAyLjY0OC0xLjI1OCAzLjY0IDIuMDQ3LjAyNSAzLjQ0Mi0uNTA5IDQuNjQzLTEuNThBMTMuMiAxMy4yIDAgMCAwIDEyIDIxYzYuMDc1IDAgMTEtNC4wMjkgMTEtOVMxOC4wNzUgMyAxMiAzWiIvPjwvc3ZnPg%3D%3D" alt="iMessage">
   </p>
 
+  <p>
+    <a href="https://trendshift.io/repositories/169119#achievements">
+      <img src="https://trendshift.io/api/badge/trendshift/repositories/169119/daily?language=JavaScript" alt="DSH-IM — Trendshift #3 JavaScript Repository Of The Day" width="420">
+    </a>
+  </p>
+
   <p><a href="README.md">简体中文</a> · <strong>English</strong></p>
 </div>
 
