@@ -266,6 +266,63 @@ test('modern workspace baseline detects an archived binding without loading its 
   assert.deepEqual(calls, ['workspace/follow', 'workspace/follow']);
 });
 
+test('modern Gateway requests carry the in-process Peer that owns them', async () => {
+  const requests = [];
+  const peerOptions = [];
+  const peer = Object.freeze({
+    signal: new AbortController().signal,
+    principal: { kind: 'owner' },
+  });
+  const { ctx } = fakeContext({
+    invoke(request) {
+      requests.push(request);
+      return { items: [] };
+    },
+    stream(request) {
+      requests.push(request);
+      return asyncValues({ type: 'baseline', value: { items: [], archivedSessionIds: [] } });
+    },
+  });
+  ctx.connection = {
+    createPeer(options) {
+      peerOptions.push(options);
+      return peer;
+    },
+  };
+  const api = modernHarnessApi(ctx, {});
+  assert.equal(modernHarnessApi(ctx, {}), api);
+  await api.workspace.list({ rpcId: 'workspace', payload: {} });
+  await api.sessions.list({ rpcId: 'sessions', payload: {} });
+  assert.deepEqual(peerOptions, [{ principal: { kind: 'owner' }, interactions: 'none' }]);
+  assert.deepEqual(
+    requests.map((request) => `${request.namespace}/${request.method}`),
+    ['workspace/follow', 'session/list'],
+  );
+  assert.ok(requests.every((request) => request.peer === peer));
+});
+
+test('modern Gateway requests stay Peer-less on Hosts that cannot create one', async () => {
+  const requests = [];
+  const { ctx } = fakeContext({
+    invoke(request) {
+      requests.push(request);
+      return { items: [] };
+    },
+    stream(request) {
+      requests.push(request);
+      return asyncValues({ type: 'baseline', value: { items: [], archivedSessionIds: [] } });
+    },
+  });
+  // An older Host exposes Connection for its fetch registry but never asks a
+  // Remote caller for a Peer, so the request must keep its original shape.
+  ctx.connection = { fetch: { register() {} } };
+  const api = modernHarnessApi(ctx, {});
+  await api.workspace.list({ rpcId: 'workspace', payload: {} });
+  await api.sessions.list({ rpcId: 'sessions', payload: {} });
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((request) => !Object.hasOwn(request, 'peer')));
+});
+
 function sessionFixture(api, id = 'session') {
   const events = [];
   if (api === 'snapshotEvents') {

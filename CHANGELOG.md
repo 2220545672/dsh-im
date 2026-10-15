@@ -6,6 +6,11 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+### Fixed / 修复
+
+- 适配 DSH 0.2.1：新版 Host 要求每次 Remote 调用携带来电 Peer，此前未携带，导致所有 `host-api` 调用（`workspace.list`、`session.create` 等）在约 1ms 内被拒、每条 IM 消息都回 `INTERNAL_UNKNOWN`。现按 Host 根创建一个进程内 Peer（`ctx.connection.createPeer`，owner 身份、不参与交互应答）并随每个请求发送；不提供该 API 的旧 Host 保持原请求形状（[#363](https://github.com/xmanrui/dsh-im/issues/363)）。
+  Added DSH 0.2.1 compatibility: the newer Host identifies the caller of every Remote method, so a request without a Peer was rejected in about 1ms and every IM message answered `INTERNAL_UNKNOWN` (`workspace.list`, `session.create`, and every other `host-api` call). The plugin now creates one in-process Peer per Host root (`ctx.connection.createPeer`, owner principal, no interaction answering) and sends it with every request, while older Hosts without that API keep the original request shape ([#363](https://github.com/xmanrui/dsh-im/issues/363)).
+
 ## [4.39.0] - 2026-10-13
 
 本版本的 Matrix 会话上下文与群聊追问能力来自 [@Dong09](https://github.com/Dong09) 的贡献（[#350](https://github.com/xmanrui/dsh-im/pull/350)），感谢！

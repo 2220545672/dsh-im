@@ -37,11 +37,14 @@ function rpcResult(request, operation) {
   );
 }
 
-function remoteRequest(namespace, method, args, signal) {
+function remoteRequest(namespace, method, args, signal, peer) {
   return {
     namespace,
     method,
     args,
+    // Hosts from 0.2.1 on identify the caller of every Remote method and reject a
+    // request that carries no Peer; older Hosts need no Peer and cannot create one.
+    ...(peer === undefined ? {} : { peer }),
     ...(signal === undefined ? {} : { signal }),
   };
 }
@@ -198,6 +201,7 @@ class ModernHarnessApi {
   #gateway;
   #deliveryService;
   #scope;
+  #peer;
   #mux = new Set();
   #pendingQuestions = new Map();
   #pendingApprovals = new Map();
@@ -206,9 +210,10 @@ class ModernHarnessApi {
   #disposers = [];
   #disposed = false;
 
-  constructor(ctx, gateway, scope) {
+  constructor(ctx, gateway, scope, peer) {
     this.#gateway = gateway;
     this.#scope = scope;
+    this.#peer = peer;
 
     this.host = Object.freeze({
       describe: (request) => rpcResult(request, () => ({ ready: true, transport: 'typert' })),
@@ -292,7 +297,7 @@ class ModernHarnessApi {
   }
 
   async #invoke(namespace, method, args, signal) {
-    return this.#gateway.invoke(remoteRequest(namespace, method, args, signal));
+    return this.#gateway.invoke(remoteRequest(namespace, method, args, signal, this.#peer));
   }
 
   async #streamFirst(namespace, method, args, signal) {
@@ -303,7 +308,7 @@ class ModernHarnessApi {
     let iterator;
     try {
       const source = await this.#gateway.stream(remoteRequest(
-        namespace, method, args, streamSignal,
+        namespace, method, args, streamSignal, this.#peer,
       ));
       iterator = source[Symbol.asyncIterator]();
       const first = await iterator.next();
@@ -869,6 +874,18 @@ class ModernHarnessApi {
   }
 }
 
+/**
+ * Create the in-process Peer this Host requires on every Remote request.
+ * @returns the Host's Peer, or undefined on Hosts that never ask for one.
+ */
+function inProcessPeer(ctx) {
+  const connection = ctx?.connection;
+  if (typeof connection?.createPeer !== 'function') return undefined;
+  // The plugin runs inside the Host with the owner's authority, and it answers
+  // approvals and questions through its own listeners rather than as a Peer.
+  return connection.createPeer({ principal: { kind: 'owner' }, interactions: 'none' });
+}
+
 /** Create one modern compatibility API per Cordis Host root. */
 export function modernHarnessApi(ctx, { deliveryService } = {}) {
   const scope = ctx?.root ?? ctx;
@@ -884,7 +901,7 @@ export function modernHarnessApi(ctx, { deliveryService } = {}) {
   if (!gateway || typeof gateway.invoke !== 'function' || typeof gateway.stream !== 'function') {
     throw new TypeError('dsh-im requires the modern Host Typert gateway');
   }
-  const api = new ModernHarnessApi(ctx, gateway, scope);
+  const api = new ModernHarnessApi(ctx, gateway, scope, inProcessPeer(ctx));
   api.setDeliveryService(deliveryService);
   modernApis.set(scope, api);
   if (typeof ctx.effect === 'function') {
